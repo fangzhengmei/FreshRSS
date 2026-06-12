@@ -1129,28 +1129,32 @@ Feed刷新 → 解析新条目 → Extension Hook (EntryBeforeInsert)
                           ▼
                Entry::applyFilterActions()
                           │
-            ┌─────────────┼─────────────┐
-            ▼             ▼             ▼
-   UserConfiguration   Category     Feed
-   .applyFilterActions  .applyFilter  .applyFilter
-   (全局规则)           (分类规则)     (Feed规则)
-            │             │             │
-            └──────┬──────┘             │
-                   ▼                    ▼
-         FilterActionsTrait::applyFilterActions()
-                   │
-                   ▼
-         遍历所有 FilterAction
-                   │
-                   ▼
-         Entry::matches(filterAction.booleanSearch())
-                   │
-            ┌──────┴──────┐
-            ▼ 匹配         ▼ 不匹配
-     执行 actions:     跳过
-     • 'read'  → entry._isRead(true)
-     • 'star'  → entry._isFavorite(true)
-     • 'label' → 设置 applyLabel=true（延迟处理）
+          ┌───────────────┼───────────────┐
+          ▼               ▼               ▼
+① UserConf          ② Category        ③ Feed
+  .applyFilterActions  .applyFilterActions  .applyFilterActions
+  (全局规则)           (分类规则)         (Feed规则)
+          │               │               │
+          └───────┬───────┘               │
+                  ▼                       ▼
+        FilterActionsTrait::applyFilterActions()
+          （每个宿主加载自身独立的 attributes.filters）
+                  │
+                  ▼
+        遍历该宿主的所有 FilterAction
+                  │
+                  ▼
+        Entry::matches(filterAction.booleanSearch())
+                  │
+           ┌──────┴──────┐
+           ▼ 匹配          ▼ 不匹配
+      执行 actions:     跳过
+      • 'read'  → entry._isRead(true)  （守卫：!isRead，首次生效）
+      • 'star'  → entry._isFavorite(true)  （守卫：!isUpdated）
+      • 'label' → 设置 $applyLabel=true
+                   ⚠️ 但此三次调用均未传递 &$applyLabel 引用参数，
+                      label 结果在此路径被直接丢弃！
+                      label 的真实执行路径见 9.3.2
 ```
 
 [FilterActionsTrait.php#L125-L153](file:///d:/fz/0601-1/solo-dogfeeding/code/24-FreshRSS/app/Models/FilterActionsTrait.php#L125-L153)
@@ -1184,7 +1188,43 @@ public function applyFilterActions(FreshRSS_Entry $entry, ?bool &$applyLabel = n
 }
 ```
 
-**优先级**：全局规则 → 分类规则 → Feed规则，三者依次执行，后者的结果可能覆盖前者。
+**执行顺序与生效逻辑**：全局规则 → 分类规则 → Feed规则，三者**严格按代码调用顺序依次独立执行**，不存在"后者覆盖前者"的语义，而是**顺序执行 + 守卫保护 + 效果累加**。
+
+#### 逐层调用的代码轨迹
+
+从 [Entry.php#L915-L917](file:///d:/fz/0601-1/solo-dogfeeding/code/24-FreshRSS/app/Models/Entry.php#L915-L917) 开始：
+
+```php
+FreshRSS_Context::userConf()->applyFilterActions($this);  // 第1层：全局规则
+$feed->category()?->applyFilterActions($this);          // 第2层：分类规则
+$feed->applyFilterActions($this);                       // 第3层：Feed规则
+```
+
+每次调用都独立进入 [FilterActionsTrait::applyFilterActions()](file:///d:/fz/0601-1/solo-dogfeeding/code/24-FreshRSS/app/Models/FilterActionsTrait.php#L125-L153)，遍历**该层级自身的** `filterActions()` 列表，与其他层级的规则列表完全隔离。
+
+#### 三种动作的守卫行为分析
+
+| 动作类型 | 守卫条件 | 跨层级影响 | 语义 |
+|---------|---------|-----------|------|
+| `read` | `!$entry->isRead()` | ✅ 有影响 | 先执行的层级如果标记为已读，后续层级的 `read` 动作会被守卫跳过。**先到先得** |
+| `star` | `!$entry->isUpdated()` | ❌ 无影响 | `isUpdated()` 检查的是"条目是否已在数据库中存在并被更新过"，与自动规则执行无关。三个层级独立判断，效果累加 |
+| `label` | `!$entry->isUpdated()` | ❌ 无影响 | 同上，三个层级独立判断。但因此路径未传 `&$applyLabel` 引用，结果被丢弃 |
+
+> **关键澄清**：`isUpdated()` ≠ `isFavorite()` 或 `isRead()`。`_isRead()` 和 `_isFavorite()` 只修改各自属性，**不会**修改 `is_updated` 标志。因此 `star` 和 `label` 的守卫是保护"已更新的旧条目"不被自动规则影响，而非防止多个层级重复执行。
+
+#### 执行顺序的实际效果示例
+
+假设：
+- 全局规则：`intitle:php` → `read`
+- 分类规则：`intext:framework` → `star`
+- Feed规则：`author:zend` → `read`
+
+如果新条目同时匹配所有三个条件：
+1. 全局规则先执行 → 标记为已读，触发 `EntryAutoRead` hook
+2. 分类规则执行 → `isRead()` 已为 `true`，`read` 被跳过；但 `star` 守卫检查 `isUpdated()`，新条目为 `false`，所以标记为收藏
+3. Feed规则执行 → `read` 被守卫跳过（已读）
+
+**最终效果**：已读 + 已收藏，**两个层级的不同动作累加生效**，而非覆盖。
 
 **安全约束**：`isUpdated()` 检查确保已更新的文章不会被自动标记为收藏或打标签，防止覆盖用户手动操作。
 
