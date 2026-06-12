@@ -102,7 +102,7 @@ $category->_attribute('position', $position);
 
 分类内订阅的排序规则是**固定的按名称自然排序**，不提供用户自定义排序。
 
-排序发生在两个位置：
+排序发生在三个位置：
 
 **位置一：Category 对象内部排序**
 
@@ -166,26 +166,319 @@ ORDER BY c.name, f.name
 
 该 `data-position` 可供前端 JavaScript 做拖拽排序等交互使用。
 
-分类的展开/折叠由 `display_categories` 用户配置控制：
+---
 
-[aside_feed.phtml#L107-L108](file:///d:/fz/0601-1/solo-dogfeeding/code/22-FreshRSS/app/layout/aside_feed.phtml#L107-L108)
+## 三、分类侧边栏显隐链路
+
+分类侧边栏的展开/折叠状态由 **PHP 后端**和 **JS 前端**协同控制，形成完整的显隐链路。
+
+### 3.1 `display_categories` 配置
+
+**核心配置**：`display_categories` 用户配置决定分类的默认展开行为。
+
+[config-user.default.php#L41](file:///d:/fz/0601-1/solo-dogfeeding/code/22-FreshRSS/config-user.default.php#L41)
 
 ```php
+'display_categories' => 'active',    // { active, remember, all, none }
+```
+
+可选值说明：
+
+| 值 | 说明 |
+|----|------|
+| `'all'` | 始终展开所有分类 |
+| `'active'` | 仅展开当前选中的分类（默认） |
+| `'remember'` | 展开当前选中的分类 + 记忆用户手动展开/折叠的状态 |
+| `'none'` | 折叠所有分类 |
+
+配置在上下文初始化时进行合法性校验：
+
+[Context.php#L157-L158](file:///d:/fz/0601-1/solo-dogfeeding/code/22-FreshRSS/app/Models/Context.php#L157-L158)
+
+```php
+if (!in_array(FreshRSS_Context::$user_conf->display_categories, [ 'active', 'remember', 'all', 'none' ], true)) {
+    FreshRSS_Context::$user_conf->display_categories = FreshRSS_Context::$user_conf->display_categories === true ? 'all' : 'active';
+}
+```
+
+### 3.2 PHP 端：初始渲染的展开状态
+
+PHP 端在渲染侧边栏时决定每个分类的初始展开状态。
+
+**分类展开判断逻辑**：
+
+[aside_feed.phtml#L106-L108](file:///d:/fz/0601-1/solo-dogfeeding/code/22-FreshRSS/app/layout/aside_feed.phtml#L106-L108)
+
+```php
+$c_active = FreshRSS_Context::isCurrentGet('c_' . $cat->id());
 $c_show = ($c_active && in_array(FreshRSS_Context::userConf()->display_categories, ['active', 'remember'], true))
     || FreshRSS_Context::userConf()->display_categories === 'all';
 ```
 
-`display_categories` 的可选值（默认 `'active'`）：
-- `'all'` - 始终展开所有分类
-- `'active'` - 仅展开当前选中的分类
-- `'remember'` - 展开当前选中的分类（记忆上次的展开状态）
-- `'none'` - 折叠所有分类
+逻辑拆解：
+
+| `display_categories` | 当前分类是否选中 | `$c_show` 结果 | 说明 |
+|---------------------|-----------------|---------------|------|
+| `'all'` | 任意 | `true` | 始终展开所有分类 |
+| `'active'` | 是 | `true` | 展开当前选中的分类 |
+| `'active'` | 否 | `false` | 折叠其他分类 |
+| `'remember'` | 是 | `true` | 展开当前选中的分类 |
+| `'remember'` | 否 | `false` | 其他分类初始折叠，后续由 JS 恢复 |
+| `'none'` | 任意 | `false` | 所有分类初始折叠 |
+
+**标签的展开判断逻辑**（与分类一致）：
+
+[aside_feed.phtml#L66-L67](file:///d:/fz/0601-1/solo-dogfeeding/code/22-FreshRSS/app/layout/aside_feed.phtml#L66-L67)
+
+```php
+$t_active = FreshRSS_Context::isCurrentGet('T');
+$t_show = ($t_active && in_array(FreshRSS_Context::userConf()->display_categories, ['active', 'remember'], true)) || FreshRSS_Context::userConf()->display_categories === 'all';
+```
+
+**渲染展开状态**：
+
+通过 `<ul class="tree-folder-items">` 是否添加 `active` 类来控制展开/折叠：
+
+[aside_feed.phtml#L122](file:///d:/fz/0601-1/solo-dogfeeding/code/22-FreshRSS/app/layout/aside_feed.phtml#L122)
+
+```php
+<ul class="tree-folder-items<?= $c_show ? ' active' : '' ?>">
+```
+
+展开/折叠按钮的图标也由 `$c_show` 决定：
+
+[aside_feed.phtml#L114](file:///d:/fz/0601-1/solo-dogfeeding/code/22-FreshRSS/app/layout/aside_feed.phtml#L114)
+
+```php
+<button class="dropdown-toggle" title="<?= _t('sub.category.expand') ?>"><?= _i($c_show ? 'up' : 'down') ?></button>
+```
+
+### 3.3 JS 端：用户交互的状态切换
+
+当用户点击分类的展开/折叠按钮时，由前端 JS 处理状态切换。
+
+**点击事件处理**：
+
+[main.js#L1093-L1126](file:///d:/fz/0601-1/solo-dogfeeding/code/22-FreshRSS/p/scripts/main.js#L1093-L1126)
+
+```javascript
+asideFeed.onclick = function (ev) {
+    let a = ev.target.closest('.tree-folder > .tree-folder-title > button.dropdown-toggle');
+    if (a) {
+        const icon = a.querySelector('.icon');
+        const category_id = a.closest('.category').id;
+        if (icon.alt === '🔽' || icon.innerHTML === '🔽') {
+            // 展开操作
+            if (icon.src) {
+                icon.src = icon.src.replace('/icons/down.', '/icons/up.');
+                icon.alt = '🔼';
+            } else {
+                icon.innerHTML = '🔼';
+            }
+            rememberOpenCategory(category_id, true);  // 记住状态
+        } else {
+            // 折叠操作
+            if (icon.src) {
+                icon.src = icon.src.replace('/icons/up.', '/icons/down.');
+                icon.alt = '🔽';
+            } else {
+                icon.innerHTML = '🔽';
+            }
+            rememberOpenCategory(category_id, false);  // 记住状态
+        }
+
+        const ul = a.closest('li').querySelector('.tree-folder-items');
+        // 计算可见项数量用于 CSS transition 动画
+        let nbVisibleItems = 0;
+        for (let i = ul.children.length - 1; i >= 0; i--) {
+            if (ul.children[i].offsetHeight) {
+                nbVisibleItems++;
+            }
+        }
+        ul.classList.toggle('active');
+        // CSS transition 不支持 max-height:auto，需手动设置
+        ul.style.maxHeight = ul.classList.contains('active') ? (nbVisibleItems * 4) + 'em' : 0;
+        return false;
+    }
+}
+```
+
+**状态切换的完整流程**：
+
+```
+用户点击折叠按钮
+    │
+    ▼
+判断当前状态 (icon.alt 或 innerHTML)
+    │
+    ├─ 折叠状态 (🔽) → 切换为展开状态
+    │       ├─ 替换图标 src 为 up
+    │       ├─ 设置 alt 为 🔼
+    │       └─ 调用 rememberOpenCategory(id, true)
+    │
+    └─ 展开状态 (🔼) → 切换为折叠状态
+            ├─ 替换图标 src 为 down
+            ├─ 设置 alt 为 🔽
+            └─ 调用 rememberOpenCategory(id, false)
+    │
+    ▼
+切换 .tree-folder-items 的 active 类
+    │
+    ▼
+设置 max-height 实现过渡动画
+```
+
+### 3.4 `remember` 模式：记忆分类展开状态
+
+当 `display_categories` 设置为 `'remember'` 时，系统会记住用户手动展开/折叠的分类状态。
+
+**配置传递到前端**：
+
+PHP 端通过 `javascript_vars.phtml` 将配置编码为 JSON 传递给前端 JS：
+
+[javascript_vars.phtml#L17](file:///d:/fz/0601-1/solo-dogfeeding/code/22-FreshRSS/app/views/helpers/javascript_vars.phtml#L17)
+
+```php
+'display_categories' => FreshRSS_Context::userConf()->display_categories,
+```
+
+该变量被赋值给 JS 的 `context.display_categories`。
+
+**记忆状态的存储**：
+
+[main.js#L1025-L1035](file:///d:/fz/0601-1/solo-dogfeeding/code/22-FreshRSS/p/scripts/main.js#L1025-L1035)
+
+```javascript
+function rememberOpenCategory(category_id, isOpen) {
+    if (context.display_categories === 'remember') {
+        const open_categories = JSON.parse(localStorage.getItem('FreshRSS_open_categories') || '{}');
+        if (isOpen) {
+            open_categories[category_id] = true;
+        } else {
+            delete open_categories[category_id];
+        }
+        localStorage.setItem('FreshRSS_open_categories', JSON.stringify(open_categories));
+    }
+}
+```
+
+存储机制：
+- **存储位置**：浏览器 `localStorage`（持久化存储，关闭浏览器后仍保留）
+- **存储键名**：`FreshRSS_open_categories`
+- **存储格式**：JSON 对象，键为分类 ID（如 `'c_1'`），值为 `true`（表示展开）
+- **仅展开的分类被存储**，折叠的分类从对象中删除
+
+**恢复记忆的展开状态**：
+
+页面加载时，`init_column_categories()` 函数从 localStorage 恢复展开状态：
+
+[main.js#L1058-L1069](file:///d:/fz/0601-1/solo-dogfeeding/code/22-FreshRSS/p/scripts/main.js#L1058-L1069)
+
+```javascript
+function init_column_categories() {
+    if (context.current_view !== 'normal' && context.current_view !== 'reader') {
+        return;
+    }
+
+    // Restore open categories
+    if (context.display_categories === 'remember') {
+        const open_categories = JSON.parse(localStorage.getItem('FreshRSS_open_categories') || '{}');
+        Object.keys(open_categories).forEach(function (category_id) {
+            openCategory(category_id);
+        });
+    }
+    // ... 后续的滚动位置恢复
+}
+```
+
+恢复展开状态的 `openCategory()` 函数：
+
+[main.js#L1037-L1045](file:///d:/fz/0601-1/solo-dogfeeding/code/22-FreshRSS/p/scripts/main.js#L1037-L1045)
+
+```javascript
+function openCategory(category_id) {
+    const category_element = document.getElementById(category_id);
+    if (!category_element) return;
+    category_element.querySelector('.tree-folder-items').classList.add('active');
+    const img = category_element.querySelector('button.dropdown-toggle img');
+    if (!img) return;
+    img.src = img.src.replace('/icons/down.', '/icons/up.');
+    img.alt = '🔼';
+}
+```
+
+**清除记忆状态**：
+
+当用户登出时，`extra.js` 会清除 localStorage 中的记忆状态：
+
+[extra.js#L16](file:///d:/fz/0601-1/solo-dogfeeding/code/22-FreshRSS/p/scripts/extra.js#L16)
+
+```javascript
+localStorage.removeItem('FreshRSS_open_categories');
+```
+
+### 3.5 显隐链路的完整时序图
+
+```
+页面请求
+    │
+    ▼
+PHP 端: Context 初始化
+    │  校验 display_categories 合法性
+    │
+    ▼
+PHP 端: aside_feed.phtml 渲染
+    │  计算 $c_active (当前选中的分类)
+    │  计算 $c_show (初始展开状态)
+    │  根据 $c_show 决定是否添加 'active' 类
+    │  输出 HTML
+    │
+    ▼
+浏览器: 解析 HTML + 加载 JS
+    │
+    ▼
+JS 端: init_column_categories()
+    │
+    ├─ display_categories === 'remember'?
+    │   ├─ 是: 从 localStorage 读取 FreshRSS_open_categories
+    │   │    遍历对象，调用 openCategory() 展开每个分类
+    │   └─ 否: 不做额外处理
+    │
+    ▼
+JS 端: 绑定 click 事件
+    │
+    ▼
+用户点击折叠按钮
+    │
+    ├─ 切换图标（up ↔ down）
+    ├─ 切换 .tree-folder-items 的 active 类
+    ├─ 设置 max-height 动画
+    └─ display_categories === 'remember'?
+        ├─ 是: 更新 localStorage 的 FreshRSS_open_categories
+        └─ 否: 不存储
+```
+
+### 3.6 其他显隐控制
+
+**"已读隐藏"功能（CSS 级过滤）**：
+
+[aside_feed.phtml#L6-L10](file:///d:/fz/0601-1/solo-dogfeeding/code/22-FreshRSS/app/layout/aside_feed.phtml#L6-L10)
+
+```php
+if (FreshRSS_Context::userConf()->hide_read_feeds &&
+    (FreshRSS_Context::isStateEnabled(FreshRSS_Entry::STATE_NOT_READ) || FreshRSS_Context::isStateEnabled(FreshRSS_Entry::STATE_OR_NOT_READ)) &&
+    !FreshRSS_Context::isStateEnabled(FreshRSS_Entry::STATE_READ)) {
+    $class = ' state_unread';
+}
+```
+
+当 `hide_read_feeds` 为 `true` 且当前筛选"仅未读"时，侧边栏添加 `state_unread` 类。CSS 通过此类名隐藏没有未读文章的分类和订阅。
 
 ---
 
-## 三、隐藏订阅的显隐规则
+## 四、隐藏订阅的显隐规则
 
-### 3.1 优先级与显隐的对应关系
+### 4.1 优先级与显隐的对应关系
 
 FreshRSS 的订阅优先级决定了订阅在不同视图中的可见性：
 
@@ -197,9 +490,9 @@ FreshRSS 的订阅优先级决定了订阅在不同视图中的可见性：
 | `PRIORITY_FEED` | -5 | 普通 | 显示 | 不显示 |
 | `PRIORITY_HIDDEN` | -10 | 隐藏 | 条件显示 | 不显示 |
 
-### 3.2 侧边栏中的隐藏订阅显示条件
+### 4.2 侧边栏中的隐藏订阅显示条件
 
-**核心过滤逻辑**: [aside_feed.phtml#L128-L131](file:///d:/fz/0601-1/solo-dogfeeding/code/22-FreshRSS/app/layout/aside_feed.phtml#L128-L131)
+**核心过滤逻辑**: [aside_feed.phtml#L127-L131](file:///d:/fz/0601-1/solo-dogfeeding/code/22-FreshRSS/app/layout/aside_feed.phtml#L127-L131)
 
 ```php
 foreach ($feeds as $feed):
@@ -218,81 +511,7 @@ foreach ($feeds as $feed):
 
 这种设计的意图是：隐藏订阅通常不应占用侧边栏空间，但如果用户通过 URL 直接访问了该订阅（例如收藏了书签），侧边栏仍需提供导航入口。
 
-### 3.3 "已读隐藏"功能
-
-侧边栏还有一个"隐藏已读订阅"的全局选项：
-
-[aside_feed.phtml#L6-L10](file:///d:/fz/0601-1/solo-dogfeeding/code/22-FreshRSS/app/layout/aside_feed.phtml#L6-L10)
-
-```php
-if (FreshRSS_Context::userConf()->hide_read_feeds &&
-    (FreshRSS_Context::isStateEnabled(FreshRSS_Entry::STATE_NOT_READ) || FreshRSS_Context::isStateEnabled(FreshRSS_Entry::STATE_OR_NOT_READ)) &&
-    !FreshRSS_Context::isStateEnabled(FreshRSS_Entry::STATE_READ)) {
-    $class = ' state_unread';
-}
-```
-
-当用户开启 `hide_read_feeds`（默认 `true`）且当前筛选条件为"仅未读"时，侧边栏整体添加 `state_unread` CSS 类。前端 CSS 通过此类名隐藏没有未读文章的分类和订阅，这是通过 CSS 而非 PHP 实现的过滤。
-
-### 3.4 未读数显示控制的三级体系
-
-未读数标记 `data-unread-hide="1"` 的添加逻辑：
-
-**全局级别**：
-
-[aside_feed.phtml#L23-L24](file:///d:/fz/0601-1/solo-dogfeeding/code/22-FreshRSS/app/layout/aside_feed.phtml#L23-L24)
-
-```php
-$hideSucGlobal = FreshRSS_Context::userConf()->show_unread_count !== 'all' ? ' data-unread-hide="1"' : '';
-$hideSucImportant = FreshRSS_Context::userConf()->show_unread_count !== 'none' ? '' : ' data-unread-hide="1"';
-```
-
-**分类级别**：
-
-[Category.php#L121-L123](file:///d:/fz/0601-1/solo-dogfeeding/code/22-FreshRSS/app/Models/Category.php#L121-L123)
-
-```php
-public function showUnreadCount(): bool {
-    return $this->attributeBoolean('show_unread_count') ??
-        (FreshRSS_Context::userConf()->show_unread_count === 'all');
-}
-```
-
-**订阅级别**：
-
-[Feed.php#L321-L330](file:///d:/fz/0601-1/solo-dogfeeding/code/22-FreshRSS/app/Models/Feed.php#L321-L330)
-
-```php
-public function showUnreadCount(): bool {
-    $sucGlobal = FreshRSS_Context::userConf()->show_unread_count;
-    $isImportant = $this->priority >= self::PRIORITY_IMPORTANT;
-    if ($isImportant && $sucGlobal !== 'none') {
-        return true;
-    }
-    return $this->attributeBoolean('show_unread_count') ??
-        $this->category()?->attributeBoolean('show_unread_count') ??
-        ($sucGlobal === 'all' || ($sucGlobal === 'important' && $isImportant));
-}
-```
-
-三级显示控制汇总：
-
-| 全局设置 | 分类属性 | 订阅属性 | 最终结果 |
-|---------|---------|---------|---------|
-| `all` | 未设置 | 未设置 | 显示 |
-| `all` | `true` | 未设置 | 显示 |
-| `all` | `false` | 未设置 | 隐藏 |
-| `all` | `false` | `true` | 显示 |
-| `important` | 未设置 | 未设置 | 仅重要订阅显示 |
-| `important` | `true` | 未设置 | 显示（分类级覆盖） |
-| `important` | `false` | 未设置 | 隐藏 |
-| `none` | 未设置 | 未设置 | 都不显示 |
-| `none` | 未设置 | 未设置 | 重要订阅仍显示 |
-| `none` | `true` | 未设置 | 显示（分类级覆盖） |
-
-**特殊规则**：重要订阅（`priority >= 20`）在全局设置非 `none` 时始终显示未读数，不受分类和订阅级属性覆盖。
-
-### 3.5 隐藏订阅的统计贡献
+### 4.3 隐藏订阅的统计贡献
 
 隐藏订阅的未读数**不计入分类级和全局统计**：
 
@@ -313,9 +532,199 @@ foreach ($feeds as $feed) {
 
 ---
 
-## 四、订阅移动后分类内顺序为何仍留有待处理
+## 五、未读数显示控制的三级体系
 
-### 4.1 代码中的 TODO 标注
+未读数显示控制分为**全局配置**、**分类级属性**、**订阅级属性**三级，通过 `data-unread-hide="1"` 属性标记隐藏。CSS 会将该属性的未读数替换为一个淡色的点。
+
+**CSS 处理**：
+
+[frss.css#L2310-L2316](file:///d:/fz/0601-1/solo-dogfeeding/code/22-FreshRSS/p/themes/base-theme/frss.css#L2310-L2316)
+
+```css
+/* Faint dot shown in place of the count badge when [data-unread-hide] is present */
+.aside .category .tree-folder-title .title[data-unread-hide]:not([data-unread="0"])::after,
+.aside .feed .item-title[data-unread-hide]:not([data-unread="0"])::after {
+    content: "·";
+    opacity: 0.5;
+    pointer-events: none;
+}
+```
+
+### 5.1 全局级 `data-unread-hide` 标记
+
+侧边栏顶部的全局导航项使用独立的判断逻辑：
+
+[aside_feed.phtml#L23-L24](file:///d:/fz/0601-1/solo-dogfeeding/code/22-FreshRSS/app/layout/aside_feed.phtml#L23-L24)
+
+```php
+$hideSucGlobal = FreshRSS_Context::userConf()->show_unread_count !== 'all' ? ' data-unread-hide="1"' : '';
+$hideSucImportant = FreshRSS_Context::userConf()->show_unread_count !== 'none' ? '' : ' data-unread-hide="1"';
+```
+
+| 全局项 | 判断逻辑 | 说明 |
+|--------|---------|------|
+| 全部文章、收藏、标签、分类 | `show_unread_count !== 'all'` | 仅当全局设置为 `'all'` 时显示 |
+| 重要订阅 | `show_unread_count !== 'none'` | 当全局设置不是 `'none'` 时显示 |
+
+### 5.2 分类级 `showUnreadCount()`
+
+**核心方法**：`FreshRSS_Category::showUnreadCount()`
+
+[Category.php#L121-L124](file:///d:/fz/0601-1/solo-dogfeeding/code/22-FreshRSS/app/Models/Category.php#L121-L124)
+
+```php
+public function showUnreadCount(): bool {
+    return $this->attributeBoolean('show_unread_count') ??
+        (FreshRSS_Context::userConf()->show_unread_count === 'all');
+}
+```
+
+**逻辑**：
+1. 优先使用分类自身的 `attributes.show_unread_count` 属性（`true`/`false`）
+2. 如果未设置（返回 `null`），回退到全局判断：`show_unread_count === 'all'`
+
+| 分类属性 | 全局设置 | 结果 |
+|---------|---------|------|
+| `true` | 任意 | `true`（显示） |
+| `false` | 任意 | `false`（隐藏） |
+| 未设置 | `'all'` | `true`（显示） |
+| 未设置 | `'important'` / `'none'` | `false`（隐藏） |
+
+在视图中使用：
+
+[aside_feed.phtml#L109](file:///d:/fz/0601-1/solo-dogfeeding/code/22-FreshRSS/app/layout/aside_feed.phtml#L109)
+
+```php
+$hideSucCat = $cat->showUnreadCount() ? '' : ' data-unread-hide="1"';
+```
+
+### 5.3 订阅级 `showUnreadCount()`
+
+**核心方法**：`FreshRSS_Feed::showUnreadCount()`
+
+[Feed.php#L321-L330](file:///d:/fz/0601-1/solo-dogfeeding/code/22-FreshRSS/app/Models/Feed.php#L321-L330)
+
+```php
+public function showUnreadCount(): bool {
+    $sucGlobal = FreshRSS_Context::userConf()->show_unread_count;
+    $isImportant = $this->priority >= self::PRIORITY_IMPORTANT;
+    if ($isImportant && $sucGlobal !== 'none') {
+        return true;
+    }
+    return $this->attributeBoolean('show_unread_count') ??
+        $this->category()?->attributeBoolean('show_unread_count') ??
+        ($sucGlobal === 'all' || ($sucGlobal === 'important' && $isImportant));
+}
+```
+
+**完整逻辑解析**：
+
+#### 第一步：Important 订阅特殊规则
+```php
+if ($isImportant && $sucGlobal !== 'none') {
+    return true;
+}
+```
+- **如果是重要订阅（priority >= 20）且全局设置不是 `'none'`** → 直接返回 `true`，强制显示未读数
+- **重要订阅在 `sucGlobal === 'none'` 时不享受此特权**，会继续后续判断
+
+#### 第二步：订阅级属性覆盖
+```php
+$this->attributeBoolean('show_unread_count') ??
+```
+- 如果订阅自身设置了 `attributes.show_unread_count`（`true` 或 `false`），使用该值
+
+#### 第三步：分类级属性覆盖
+```php
+$this->category()?->attributeBoolean('show_unread_count') ??
+```
+- 如果订阅级未设置，使用所属分类的 `attributes.show_unread_count`
+- 使用 `?->` 运算符防止分类为 `null` 的情况
+
+#### 第四步：全局回退
+```php
+($sucGlobal === 'all' || ($sucGlobal === 'important' && $isImportant))
+```
+- 如果前三级都未设置（全部返回 `null`），使用全局判断
+- `'all'` → 显示
+- `'important'` 且是重要订阅 → 显示
+- `'none'` → 不显示
+- `'important'` 但不是重要订阅 → 不显示
+
+### 5.4 重要订阅在 `none` 配置下的正确判断
+
+**此前的误解需要纠正**：
+
+| 全局设置 | 重要订阅？ | 第一步命中？ | 后续判断 | 最终结果 |
+|---------|-----------|------------|---------|---------|
+| `'all'` | 是 | 是（`sucGlobal !== 'none'`） | - | `true` ✅ |
+| `'important'` | 是 | 是（`sucGlobal !== 'none'`） | - | `true` ✅ |
+| `'none'` | 是 | **否**（`sucGlobal === 'none'`） | 进入后续判断 | 取决于属性设置 |
+
+当 `show_unread_count === 'none'` 时，重要订阅的判断流程：
+1. 第一步不命中（因为 `$sucGlobal !== 'none'` 为 `false`）
+2. 检查订阅级属性：如果设置了 `true`/`false`，使用该值
+3. 检查分类级属性：如果设置了 `true`/`false`，使用该值
+4. 全局回退：`'none' === 'all'` → `false`，`'none' === 'important'` → `false`，返回 `false`
+
+**结论**：当全局设置为 `'none'` 时，重要订阅**默认不显示**未读数，但可以通过订阅级或分类级的 `show_unread_count = true` 强制显示。
+
+这与侧边栏"重要订阅"全局项的判断逻辑一致：
+[aside_feed.phtml#L50-L53](file:///d:/fz/0601-1/solo-dogfeeding/code/22-FreshRSS/app/layout/aside_feed.phtml#L50-L53)
+
+```php
+<a class="tree-folder-title" data-unread="<?= format_number(FreshRSS_Context::$total_important_unread) ?>"<?=
+    $hideSucImportant ?> href="...">
+```
+其中 `$hideSucImportant` 在 `show_unread_count === 'none'` 时添加 `data-unread-hide="1"`。
+
+### 5.5 三级覆盖关系完整真值表
+
+| 全局设置 | 分类属性 | 订阅属性 | 是否 Important | 结果 | 说明 |
+|---------|---------|---------|---------------|------|------|
+| `'all'` | 未设置 | 未设置 | 否 | `true` | 全局 all 默认显示 |
+| `'all'` | 未设置 | 未设置 | 是 | `true` | Important 特殊规则命中 |
+| `'all'` | `false` | 未设置 | 否 | `false` | 分类级隐藏 |
+| `'all'` | `false` | 未设置 | 是 | `true` | Important 特殊规则优先于分类级 |
+| `'all'` | `false` | `true` | 否 | `true` | 订阅级显示优先于分类级 |
+| `'all'` | `false` | `true` | 是 | `true` | Important 特殊规则命中 |
+| `'important'` | 未设置 | 未设置 | 否 | `false` | 全局 important 模式，非 important 不显示 |
+| `'important'` | 未设置 | 未设置 | 是 | `true` | Important 特殊规则命中 |
+| `'important'` | `true` | 未设置 | 否 | `true` | 分类级显示 |
+| `'important'` | `true` | `false` | 否 | `false` | 订阅级隐藏优先于分类级 |
+| `'important'` | `false` | `true` | 否 | `true` | 订阅级显示优先于分类级 |
+| `'none'` | 未设置 | 未设置 | 否 | `false` | 全局 none 默认隐藏 |
+| `'none'` | 未设置 | 未设置 | 是 | `false` | Important 特殊规则在 none 下不命中 |
+| `'none'` | `true` | 未设置 | 否 | `true` | 分类级显示 |
+| `'none'` | `true` | 未设置 | 是 | `true` | 分类级显示 |
+| `'none'` | 未设置 | `true` | 否 | `true` | 订阅级显示 |
+| `'none'` | 未设置 | `true` | 是 | `true` | 订阅级显示 |
+| `'none'` | `false` | `true` | 否 | `true` | 订阅级显示优先于分类级 |
+
+### 5.6 覆盖优先级总结
+
+```
+Important 特殊规则 (sucGlobal !== 'none')
+    ↓ (优先级最高，仅对 Important 订阅有效)
+订阅级 attributes.show_unread_count
+    ↓
+分类级 attributes.show_unread_count
+    ↓ (优先级最低)
+全局回退 (all / important / none)
+```
+
+**特殊注意**：
+- Important 特殊规则**只在 `sucGlobal !== 'none'` 时生效**
+- 当 `sucGlobal === 'none'` 时，Important 订阅与普通订阅遵循相同的三级覆盖规则
+- 订阅级属性可以覆盖分类级属性
+- 分类级属性可以覆盖全局默认
+- 任何显式设置的属性（`true` 或 `false`）都会终止后续判断
+
+---
+
+## 六、订阅移动后分类内顺序为何仍留有待处理
+
+### 6.1 代码中的 TODO 标注
 
 在 `moveAction()` 方法中有一个明确的 TODO：
 
@@ -328,7 +737,7 @@ foreach ($feeds as $feed) {
 public function moveAction(): void {
 ```
 
-### 4.2 问题分析
+### 6.2 问题分析
 
 移动订阅的操作本身很简单——只更新了 `_feed` 表的 `category` 字段：
 
@@ -350,7 +759,7 @@ public function updateFeed(int $id, array $valuesTmp): bool {
 }
 ```
 
-### 4.3 当前排序的实际处理方式
+### 6.3 当前排序的实际处理方式
 
 移动订阅后，**分类内订阅的排序不是在移动操作时处理的**，而是在下次加载分类树时重新排序：
 
@@ -373,7 +782,7 @@ public function _feeds(array|FreshRSS_Feed $values): void {
 
 因此，**移动后的订阅在下次页面加载时会自动按名称排序归位**，不需要额外的排序操作。
 
-### 4.4 为何仍有 TODO
+### 6.4 为何仍有 TODO
 
 问题在于：FreshRSS **没有提供订阅级别的 position 属性**来支持用户自定义订阅顺序。
 
@@ -387,7 +796,7 @@ public function _feeds(array|FreshRSS_Feed $values): void {
 
 目前，订阅的 `attributes` JSON 字段中只有 `defaultSort` 和 `defaultOrder`，它们控制的是**文章列表**的排序，而非订阅自身在侧边栏中的排序。
 
-### 4.5 相关的用户配置
+### 6.5 相关的用户配置
 
 虽然不能自定义订阅位置，但有一个相关的简化配置：
 
@@ -401,9 +810,9 @@ public function _feeds(array|FreshRSS_Feed $values): void {
 
 ---
 
-## 五、默认分类在中文界面的名称来源
+## 七、默认分类在中文界面的名称来源
 
-### 5.1 名称的运行时覆盖机制
+### 7.1 名称的运行时覆盖机制
 
 默认分类的名称有一个特殊机制：**数据库中存储的名称与界面显示的名称是分离的**。
 
@@ -437,7 +846,7 @@ public function _name(string $value): void {
 - 用户无法修改默认分类的名称
 - 语言切换后，默认分类的名称会自动跟随变化
 
-### 5.2 翻译键的解析路径
+### 7.2 翻译键的解析路径
 
 翻译键 `gen.short.default_category` 的解析过程：
 
@@ -480,7 +889,7 @@ private static function loadLang(string $path): void {
 }
 ```
 
-### 5.3 各语言的翻译值
+### 7.3 各语言的翻译值
 
 **英语**（默认）：
 
@@ -508,7 +917,7 @@ private static function loadLang(string $path): void {
 
 翻译文件的结构：每个 i18n 子目录下的 `gen.php` 对应 `gen.*` 翻译键，文件返回一个嵌套 PHP 数组，键名 `short` 对应数组中的 `short` 子键，`default_category` 对应最终的翻译值。
 
-### 5.4 数据库中的名称与显示名称的差异
+### 7.4 数据库中的名称与显示名称的差异
 
 数据库中默认分类的名称存储有一个历史演变：
 
@@ -536,41 +945,11 @@ $cat = new FreshRSS_Category(_t('gen.short.default_category'), self::DEFAULTCATE
 
 这意味着数据库中存储的名称可能是英文 `'Uncategorized'`，也可能是创建时的语言翻译值，但**无论数据库中存储什么，运行时都会被 `_id()` 方法覆盖为当前语言的翻译值**。
 
-### 5.5 名称覆盖的完整流程图
-
-```
-数据库 _category 表
-  id=1, name='Uncategorized'  (或创建时的翻译值)
-        │
-        │  查询
-        ▼
-  CategoryDAO::searchById() / listCategories()
-        │
-        │  构建 Category 对象
-        │  调用 _id(1)
-        ▼
-  Category::_id(1)
-        │
-        │  id === DEFAULTCATEGORYID → 覆盖 name
-        ▼
-  $this->name = _t('gen.short.default_category')
-        │
-        │  翻译键解析
-        ▼
-  当前语言为 zh-CN → '未分类'
-  当前语言为 en    → 'Uncategorized'
-  当前语言为 zh-TW → '未分類'
-        │
-        │  Category::_name() 被跳过
-        ▼
-  最终显示: 当前语言的翻译值
-```
-
 ---
 
-## 六、侧边栏统计机制
+## 八、侧边栏统计机制
 
-### 6.1 统计数据结构
+### 8.1 统计数据结构
 
 **核心文件**: [Context.php](file:///d:/fz/0601-1/solo-dogfeeding/code/22-FreshRSS/app/Models/Context.php)
 
@@ -583,7 +962,7 @@ $cat = new FreshRSS_Category(_t('gen.short.default_category'), self::DEFAULTCATE
 | `$total_starred` | array | 收藏文章统计（all/read/unread） |
 | `$get_unread` | int | 当前视图的未读数 |
 
-### 6.2 统计数据初始化
+### 8.2 统计数据初始化
 
 **核心方法**: `FreshRSS_Context::updateUsingRequest()`
 
@@ -600,7 +979,7 @@ public static function updateUsingRequest(bool $computeStatistics): void {
 }
 ```
 
-### 6.3 分类级别的未读统计
+### 8.3 分类级别的未读统计
 
 **核心方法**: `FreshRSS_Category::countUnread()`
 
@@ -616,7 +995,7 @@ public static function countUnread(array $categories, int $minPriority = FreshRS
 }
 ```
 
-### 6.4 单个分类的未读统计
+### 8.4 单个分类的未读统计
 
 **核心方法**: `FreshRSS_Category::nbNotRead()`
 
@@ -650,7 +1029,7 @@ public function nbNotRead(int $minPriority = FreshRSS_Feed::PRIORITY_FEED): int 
 2. **未预加载 feeds**：通过 DAO 直接查询数据库
 3. **已预加载 feeds**：遍历该分类下所有订阅，累加满足优先级要求的订阅的未读数
 
-### 6.5 单个订阅的未读统计
+### 8.5 单个订阅的未读统计
 
 **核心方法**: `FreshRSS_Feed::nbNotRead()`
 
@@ -666,7 +1045,7 @@ public function nbNotRead(): int {
 }
 ```
 
-### 6.6 数据库级别的缓存
+### 8.6 数据库级别的缓存
 
 Feed 表中有缓存字段用于存储未读数和文章总数：
 
@@ -702,7 +1081,7 @@ public function updateCachedValues(int ...$feedIds): int|false {
 - 提交新文章后
 - 标记已读后
 
-### 6.7 侧边栏视图渲染
+### 8.7 侧边栏视图渲染
 
 **核心文件**: [aside_feed.phtml](file:///d:/fz/0601-1/solo-dogfeeding/code/22-FreshRSS/app/layout/aside_feed.phtml)
 
@@ -737,7 +1116,7 @@ public static function categories(): array {
 }
 ```
 
-### 6.8 分类列表预加载
+### 8.8 分类列表预加载
 
 **核心方法**: `FreshRSS_CategoryDAO::listCategories()`
 
@@ -755,9 +1134,9 @@ ORDER BY c.name, f.name
 
 ---
 
-## 七、三者之间的关系
+## 九、三者之间的关系
 
-### 7.1 层级结构关系
+### 9.1 层级结构关系
 
 ```
 侧边栏 (Sidebar)
@@ -775,28 +1154,27 @@ ORDER BY c.name, f.name
         └── ...
 ```
 
-### 7.2 数据流关系
+### 9.2 显隐控制数据流
 
 ```
-数据库表: _entry (文章)
-    │
-    ├── 每个文章有 is_read 字段和 id_feed 外键
-    ▼
-数据库表: _feed (订阅)
-    │
-    ├── category 外键关联到 _category.id
-    ├── cache_nbUnreads 缓存未读数
-    ├── priority 优先级字段
-    ├── attributes JSON (show_unread_count, defaultSort, defaultOrder)
-    │
-    ▼
-数据库表: _category (分类)
-    │
-    ├── id=1 为默认分类
-    └── attributes JSON (position, show_unread_count, archiving, defaultSort, defaultOrder)
+用户配置 (config.php)
+  ├── display_categories: 'active' | 'remember' | 'all' | 'none'
+  │     │
+  │     ├─ PHP 端: 控制初始展开状态 ($c_show)
+  │     └─ JS 端: context.display_categories 控制 remember 模式
+  │
+  ├── show_unread_count: 'all' | 'important' | 'none'
+  │     │
+  │     ├─ 全局导航项: $hideSucGlobal / $hideSucImportant
+  │     ├─ 分类级: showUnreadCount() 的回退值
+  │     └─ 订阅级: showUnreadCount() 的 Important 特殊规则和回退值
+  │
+  └── hide_read_feeds: true | false
+        │
+        └─ CSS 级过滤: 添加 state_unread 类隐藏已读项
 ```
 
-### 7.3 统计聚合关系
+### 9.3 统计聚合关系
 
 未读数统计是**自底向上**聚合的：
 
@@ -811,7 +1189,7 @@ ORDER BY c.name, f.name
 - 分类视图 (`nbNotRead()`)：默认统计 `priority >= PRIORITY_FEED (-5)` 的订阅
 - 隐藏订阅 (`PRIORITY_HIDDEN = -10`)：不贡献任何统计
 
-### 7.4 移动订阅对统计的影响
+### 9.4 移动订阅对统计的影响
 
 移动订阅不会改变文章的已读/未读状态，但会影响分类级别的统计：
 
@@ -828,7 +1206,7 @@ ORDER BY c.name, f.name
 
 由于分类的未读数是通过其订阅聚合的，移动订阅后不需要额外操作，下一次查询时会自动反映新的统计结果。
 
-### 7.5 默认分类的特殊角色
+### 9.5 默认分类的特殊角色
 
 默认分类在整个系统中扮演着"回收站"和"安全网"的角色：
 
@@ -838,37 +1216,44 @@ ORDER BY c.name, f.name
 4. **不可删除**：默认分类不能被删除，保证系统至少有一个分类
 5. **名称不可修改**：默认分类的名称始终使用翻译值，用户无法自定义
 
-### 7.6 缓存与性能优化
+### 9.6 缓存与性能优化
 
 为了避免频繁的数据库查询，系统使用了多层缓存：
 
 1. **数据库缓存**：`_feed.cache_nbUnreads` 和 `_feed.cache_nbEntries`
 2. **对象缓存**：`FreshRSS_Feed::$nbNotRead` 和 `FreshRSS_Category::$nbNotRead`
 3. **上下文缓存**：`FreshRSS_Context::$categories` 和 `FreshRSS_Context::$total_unread`
+4. **前端状态缓存**：`localStorage.FreshRSS_open_categories`（remember 模式）
 
 缓存更新时机：
 - 刷新订阅后 (`actualizeFeedsAndCommit`)
 - 标记文章已读后
 - 清理旧文章后
 - 新增/删除文章后
+- 用户手动展开/折叠分类后（仅前端缓存）
 
 ---
 
-## 八、关键代码文件索引
+## 十、关键代码文件索引
 
 | 功能 | 文件 | 关键方法/行号 |
 |------|------|--------------|
-| 分类模型 | [Category.php](file:///d:/fz/0601-1/solo-dogfeeding/code/22-FreshRSS/app/Models/Category.php) | `isDefault()`, `nbNotRead()`, `feeds()`, `sortFeeds()`, `_id()`, `_name()` |
-| 分类DAO | [CategoryDAO.php](file:///d:/fz/0601-1/solo-dogfeeding/code/22-FreshRSS/app/Models/CategoryDAO.php) | `DEFAULTCATEGORYID`, `checkDefault()`, `listSortedCategories()`, `listCategories()`, `countNotRead()`, `resetDefaultCategoryName()` |
+| 分类模型 | [Category.php](file:///d:/fz/0601-1/solo-dogfeeding/code/22-FreshRSS/app/Models/Category.php) | `isDefault()`, `nbNotRead()`, `feeds()`, `sortFeeds()`, `_id()`, `_name()`, `showUnreadCount()` |
+| 分类DAO | [CategoryDAO.php](file:///d:/fz/0601-1/solo-dogfeeding/code/22-FreshRSS/app/Models/CategoryDAO.php) | `DEFAULTCATEGORYID`, `checkDefault()`, `listSortedCategories()`, `listCategories()`, `countNotRead()` |
 | 订阅模型 | [Feed.php](file:///d:/fz/0601-1/solo-dogfeeding/code/22-FreshRSS/app/Models/Feed.php) | `category()`, `nbNotRead()`, `priority()`, `showUnreadCount()` |
 | 订阅DAO | [FeedDAO.php](file:///d:/fz/0601-1/solo-dogfeeding/code/22-FreshRSS/app/Models/FeedDAO.php) | `changeCategory()`, `updateFeed()`, `updateCachedValues()`, `listByCategory()` |
 | 属性Trait | [AttributesTrait.php](file:///d:/fz/0601-1/solo-dogfeeding/code/22-FreshRSS/app/Models/AttributesTrait.php) | `attributeInt()`, `attributeBoolean()`, `attributeString()`, `_attribute()` |
-| 上下文 | [Context.php](file:///d:/fz/0601-1/solo-dogfeeding/code/22-FreshRSS/app/Models/Context.php) | `categories()`, `updateUsingRequest()`, `$total_unread` |
+| 上下文 | [Context.php](file:///d:/fz/0601-1/solo-dogfeeding/code/22-FreshRSS/app/Models/Context.php) | `categories()`, `updateUsingRequest()`, `$total_unread`, `display_categories` 校验 |
+| 用户配置 | [UserConfiguration.php](file:///d:/fz/0601-1/solo-dogfeeding/code/22-FreshRSS/app/Models/UserConfiguration.php) | 属性声明 (PHPDoc) |
 | 分类控制器 | [categoryController.php](file:///d:/fz/0601-1/solo-dogfeeding/code/22-FreshRSS/app/Controllers/categoryController.php) | `deleteAction()`, `updateAction()`（position 设置） |
 | 订阅控制器 | [feedController.php](file:///d:/fz/0601-1/solo-dogfeeding/code/22-FreshRSS/app/Controllers/feedController.php) | `moveFeed()`, `moveAction()`（含 TODO）, `addFeed()` |
 | 订阅管理控制器 | [subscriptionController.php](file:///d:/fz/0601-1/solo-dogfeeding/code/22-FreshRSS/app/Controllers/subscriptionController.php) | `feedAction()` |
-| 侧边栏视图 | [aside_feed.phtml](file:///d:/fz/0601-1/solo-dogfeeding/code/22-FreshRSS/app/layout/aside_feed.phtml) | 分类树渲染、隐藏过滤、未读数显示控制 |
+| 配置控制器 | [configureController.php](file:///d:/fz/0601-1/solo-dogfeeding/code/22-FreshRSS/app/Controllers/configureController.php) | `display_categories` 配置保存 |
+| 侧边栏视图 | [aside_feed.phtml](file:///d:/fz/0601-1/solo-dogfeeding/code/22-FreshRSS/app/layout/aside_feed.phtml) | 分类树渲染、隐藏过滤、未读数显示控制、展开状态初始渲染 |
+| JS 变量模板 | [javascript_vars.phtml](file:///d:/fz/0601-1/solo-dogfeeding/code/22-FreshRSS/app/views/helpers/javascript_vars.phtml) | `context.display_categories` 传递到前端 |
+| 主 JS | [main.js](file:///d:/fz/0601-1/solo-dogfeeding/code/22-FreshRSS/p/scripts/main.js) | `rememberOpenCategory()`, `openCategory()`, `init_column_categories()`, 点击事件处理 |
+| 额外 JS | [extra.js](file:///d:/fz/0601-1/solo-dogfeeding/code/22-FreshRSS/p/scripts/extra.js) | 登出时清除 localStorage 记忆 |
+| 主题 CSS | [frss.css](file:///d:/fz/0601-1/solo-dogfeeding/code/22-FreshRSS/p/themes/base-theme/frss.css) | `data-unread-hide` 样式处理 |
 | 翻译系统 | [Translate.php](file:///d:/fz/0601-1/solo-dogfeeding/code/22-FreshRSS/lib/Minz/Translate.php) | `t()`, `resolveKey()`, `loadKey()` |
 | 中文翻译 | [zh-CN/gen.php](file:///d:/fz/0601-1/solo-dogfeeding/code/22-FreshRSS/app/i18n/zh-CN/gen.php) | `'default_category' => '未分类'` |
-| 英语翻译 | [en/gen.php](file:///d:/fz/0601-1/solo-dogfeeding/code/22-FreshRSS/app/i18n/en/gen.php) | `'default_category' => 'Uncategorized'` |
-| 用户默认配置 | [config-user.default.php](file:///d:/fz/0601-1/solo-dogfeeding/code/22-FreshRSS/config-user.default.php) | `show_unread_count`, `display_categories`, `hide_read_feeds` |
+| 英语翻译 | [en/
