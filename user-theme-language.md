@@ -566,13 +566,19 @@ FreshRSS_Themes::load('NonExistent')
 `darkMode_auto` 是独立的 CSS class，作用于 `<html>` 元素的 `darkMode_*` 前缀（见第 4.5 节），与 `theme_*` class 是两套机制。
 
 **普通样式（LTR）中的分布**：
-- 搜索全部 `p/themes/**/*.css`，`:root.darkMode_auto` 选择器**仅出现在 Origine 主题**，共 24 处，集中在 [origine.css L1239](file:///d:/fz/0601-1/solo-dogfeeding/code/29-FreshRSS/p/themes/Origine/origine.css#L1239)、[L1327-L1358](file:///d:/fz/0601-1/solo-dogfeeding/code/29-FreshRSS/p/themes/Origine/origine.css#L1327-L1358)
-- `base-theme/frss.css`、Dark、Flat、Swage、Nord 等**所有其他内置主题均无 `:root.darkMode_auto` 选择器**
-- 覆盖的 UI 元素：`:root.darkMode_auto` 自身的变量定义、`.nav_menu .btn`、`.nav_menu .dropdown-menu`、`.header`、`.btn.active .icon`、`.spinner` 共 6 类元素
+- 搜索全部 `p/themes/**/*.css`，`:root.darkMode_auto` 选择器**仅出现在 Origine 主题**
+- [origine.css](file:///d:/fz/0601-1/solo-dogfeeding/code/29-FreshRSS/p/themes/Origine/origine.css) **共 12 行**，集中在 [L1239](file:///d:/fz/0601-1/solo-dogfeeding/code/29-FreshRSS/p/themes/Origine/origine.css#L1239)、[L1327-L1358](file:///d:/fz/0601-1/solo-dogfeeding/code/29-FreshRSS/p/themes/Origine/origine.css#L1327-L1358)
+- 这 12 行对应 8 条 CSS 规则（其中 L1335-L1337 是同一条规则的 3 个逗号分隔选择器，L1353-L1354 是同一条规则的 2 个逗号分隔选择器）
+- `base-theme/frss.css`、Dark、Flat、Swage、Nord 等**所有其他内置主题的普通 CSS 中 `darkMode_auto` 出现次数均为 0**
+- 覆盖的 UI 元素：`:root.darkMode_auto` 自身的 CSS 变量定义、`.nav_menu .btn`（含 hover/active/dropdown-target 共 4 种状态）、`.nav_menu.dropdown-menu`、`.nav_menu`、`.header`、`.btn.active .icon` + `.btn:active .icon`、`.spinner`，共 6 类元素
 
 **RTL 样式中的分布**：
-- 仅存在于 [origine.rtl.css L1239](file:///d:/fz/0601-1/solo-dogfeeding/code/29-FreshRSS/p/themes/Origine/origine.rtl.css#L1239)、[L1327-L1358](file:///d:/fz/0601-1/solo-dogfeeding/code/29-FreshRSS/p/themes/Origine/origine.rtl.css#L1327-L1358)，同样 24 处，与普通样式一一对应
-- 由于 RTL 替换发生在 CSS 文件名层面（`origine.css` → `origine.rtl.css`），RTL 页面的 `darkMode_auto` 选择器与 LTR 页面完全等价，只是应用在 RTL 布局下
+- [origine.rtl.css](file:///d:/fz/0601-1/solo-dogfeeding/code/29-FreshRSS/p/themes/Origine/origine.rtl.css) **共 12 行**，集中在 [L1239](file:///d:/fz/0601-1/solo-dogfeeding/code/29-FreshRSS/p/themes/Origine/origine.rtl.css#L1239)、[L1327-L1358](file:///d:/fz/0601-1/solo-dogfeeding/code/29-FreshRSS/p/themes/Origine/origine.rtl.css#L1327-L1358)
+- 行号、选择器、规则结构与 origine.css **逐行一一对应**，同样 12 行 / 8 条规则
+- 所有其他内置主题的 `.rtl.css` 中 `darkMode_auto` 出现次数均为 0
+- 由于 RTL 替换发生在 CSS 文件名层面（`origine.css` → `origine.rtl.css`，见 [FreshRSS.php L132-L135](file:///d:/fz/0601-1/solo-dogfeeding/code/29-FreshRSS/app/FreshRSS.php#L132-L135)），RTL 页面的 `darkMode_auto` 选择器与 LTR 页面完全等价，只是应用在 RTL 布局下
+
+**合计**：全部内置主题的全部 CSS 文件中 `darkMode_auto` 共 24 行（普通 12 + RTL 12），且全部位于 Origine 主题。
 
 **无效主题值时的表现**：
 - 无效主题回退到 Origine 后，`origine.css` / `origine.rtl.css` 被正常加载，`darkMode_auto` 相关选择器**全部生效**
@@ -623,7 +629,7 @@ FreshRSS_Themes::load('NonExistent')
 | HTML `theme_*` class | ✅ 已证实为无效值 | 与实际加载的 Origine 不一致，但当前不影响样式 |
 | 第三方自定义主题 CSS | ⚠️ 需谨慎判断 | 可能受影响（取决于是否使用 `.theme_*` 选择器） |
 | 简版/预览布局的 theme class 缺失 | ⚠️ 需谨慎判断 | 与无效主题值无关，但第三方主题同样受此影响 |
-| load() 返回 false | ✅ 已证实无 CSS | 极端情况，页面无样式 |
+| load() 返回 false | ✅ 已证实无主题 CSS/JS | 极端情况，`main.js` 一定保留，`extra.js` 按 controller 条件追加 |
 
 ### 5.3 无效 darkMode 值
 
