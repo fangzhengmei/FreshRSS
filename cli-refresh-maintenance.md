@@ -574,7 +574,34 @@ Minz_ExtensionManager::callHookVoid(Minz_HookType::FreshrssUserMaintenance);  //
 **刷新策略：**
 - 按 `lastUpdate` 升序排列，优先刷新最久未更新的 feed
 - 支持按优先级过滤（`PRIORITY_MAIN_STREAM`）
-- 每个 feed 刷新前检查 TTL，未过期则跳过
+- 每个 feed 刷新前检查 TTL，未过期则跳过——但有例外（见下方"TTL 未到期时的缓存复用路径"）
+
+**TTL 未到期时的缓存复用路径：**
+
+当 `time() <= feed.lastUpdate + ttl` 时，本应跳过该 feed 不重新从源拉取。但在多用户场景下，不同用户订阅了同一个 feed URL，它们共享同一个磁盘缓存文件（[`cacheFilename()`](file:///d:/fz/0601-1/solo-dogfeeding/code/30-FreshRSS/app/Models/Feed.php#L1295-L1317) 基于 URL 生成，不包含用户标识）。如果用户 A 先刷新了某个 feed，缓存文件被更新，用户 B 的 TTL 还没到期，代码会检查是否可以**复用用户 A 产生的新缓存**，避免重复拉取源站。
+
+判断逻辑（[feedController.php#L519-L528](file:///d:/fz/0601-1/solo-dogfeeding/code/30-FreshRSS/app/Controllers/feedController.php#L519-L528)）：
+
+```php
+if ($simplePiePush === null && $feed_id === null && (time() <= $feed->lastUpdate() + $ttl)) {
+    $ε = 10;  // 容差偏移（秒）
+    if ($mtime <= 0 ||
+        $feed->lastUpdate() + $ε >= $mtime ||
+        time() + $ε >= $mtime + FreshRSS_Context::systemConf()->limits['cache_duration']) {
+        continue;  // Nothing newer from other users
+    }
+    Minz_Log::debug('Feed ... was updated at ... by another user; take advantage of newer cache.');
+}
+```
+
+三条跳过条件含义：
+1. `$mtime <= 0`：共享缓存文件不存在，无法复用
+2. `$feed->lastUpdate() + ε >= $mtime`：缓存文件的时间戳不比自己上次刷新更新，说明没有其他用户产生新缓存
+3. `time() + ε >= $mtime + cache_duration`：缓存已超出系统 `cache_duration`（默认 800 秒）有效期
+
+当三条均不满足时——即缓存比自己的 `lastUpdate` 更新、且仍在 `cache_duration` 有效期内——代码会**继续往下走**，使用 `load()` 加载已有的共享缓存文件，而不是从源站拉取，从而节省带宽和请求。
+
+**前提条件**：此路径仅在 `$simplePiePush === null`（非 WebSub 推送）且 `$feed_id === null`（非指定 feed 刷新）时生效，手动指定 feed ID 或 WebSub 推送不受 TTL 限制。
 
 **单 Feed 刷新步骤：**
 
@@ -715,8 +742,10 @@ function invalidateHttpCache(string $username = ''): bool {
 
 **原理：** 通过更新用户数据目录的 mtime 时间戳，使 HTTP 条件请求（`If-Modified-Since`、`ETag`）失效，强制客户端重新获取数据。
 
-**使用场景：**
-- 刷新订阅后
-- 清理旧条目后
-- 数据库优化后
-- 任何修改用户数据的操作后
+**各命令/入口的缓存失效情况：**
+- ✅ `actualize-user.php` — [L49](file:///d:/fz/0601-1/solo-dogfeeding/code/30-FreshRSS/cli/actualize-user.php#L49) 调用 `invalidateHttpCache($username)`
+- ✅ `purge.php` — [L39](file:///d:/fz/0601-1/solo-dogfeeding/code/30-FreshRSS/cli/purge.php#L39) 调用 `invalidateHttpCache($username)`
+- ✅ `actualize_script.php` — [L108](file:///d:/fz/0601-1/solo-dogfeeding/code/30-FreshRSS/app/actualize_script.php#L108) 调用 `invalidateHttpCache()`
+- ✅ `greader.php` — [L331](file:///d:/fz/0601-1/solo-dogfeeding/code/30-FreshRSS/p/api/greader.php#L331) 调用 `invalidateHttpCache($user)`
+- ❌ `db-optimize.php` — **不调用** `invalidateHttpCache()`，优化后客户端无法感知变化
+- ❌ `pshb.php` — 不调用 `invalidateHttpCache()`（刷新的 feed 自身会更新 `lastUpdate`，但不会 touch 用户目录 mtime）
