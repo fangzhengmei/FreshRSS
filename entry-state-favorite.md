@@ -108,7 +108,7 @@ WHERE ...
 
 可选按 `catId` 或 `feedId` 限定重算范围。**这是列表页侧栏、标题栏未读数与数据库保持一致的关键机制**——所有写操作最终都会触达它。
 
-> **关键差异伏笔**：`markFavorite()` 没有对应的 `updateCacheFavorites()` 方法，因为 `_feed` 表根本没有 `cache_nbFavorites` 字段。收藏的总数和未读数在每次页面加载时通过 `COUNT(*)` 实时计算。
+> **关键差异伏笔**：`markFavorite()` 没有对应的 `updateCacheFavorites()` 方法，因为 `_feed` 表根本没有 `cache_nbFavorites` 字段。侧栏显示的收藏总数和未读数在每次页面加载时通过 `COUNT(*)` 实时计算，**且仅统计 `priority > -10` 的非隐藏来源**（详见第十节）。
 
 ---
 
@@ -971,3 +971,256 @@ ORDER BY e.id DESC
 5. **JS 增量更新时**：`incLabel()` 和 `incUnreadsTag()` 只修改数字文本，不改变列表内容
 
 下次页面刷新时，第 1-4 步重新执行，所有状态从数据库重新读取，完成一致性闭环。
+
+---
+
+## 十三、收藏视图与标签视图在隐藏来源上的关键不对称
+
+### 13.1 收藏视图排除隐藏来源，标签视图包含隐藏来源
+
+这是两个伪分类最重要的差异，贯穿侧栏统计、列表查询、批量操作三层。
+
+**收藏视图 `get=s`** — [EntryDAO.php L1560-L1564](file:///d:/fz/0601-1/solo-dogfeeding/code/23-FreshRSS/app/Models/EntryDAO.php#L1560-L1564)：
+
+```php
+case 's':
+    $where .= 'f.priority > ' . min(FreshRSS_Feed::PRIORITY_HIDDEN, ...) . ' ';
+    $where .= 'AND e.is_favorite=1 ';
+    break;
+```
+
+SQL JOIN `_feed`，并强制 `f.priority > -10`。隐藏来源的收藏文章**不会**出现在列表中。
+
+**标签视图 `get=t_*` / `get=T`** — [EntryDAO.php L1578-L1584](file:///d:/fz/0601-1/solo-dogfeeding/code/23-FreshRSS/app/Models/EntryDAO.php#L1578-L1584)：
+
+```php
+case 't':
+    $where .= 'et.id_tag=? ';    // 只按标签 ID 过滤
+    break;
+case 'T':
+    $where .= '1=1 ';            // 所有带标签的文章
+    break;
+```
+
+SQL JOIN `_entrytag`，但**不 JOIN `_feed`**（不需要 feed 信息），也没有 `f.priority` 条件。隐藏来源的带标签文章**会**出现在列表中。
+
+**为什么不同？**
+
+收藏与 feed 是天然绑定的——`_entry.is_favorite` 是 entry 级字段，但收藏的"可见性"取决于该 entry 所属 feed 的优先级。标签则完全独立于 feed 层级——`_entrytag` 关联只涉及 entry 和 tag 两张表，不存在"标签下的文章来自哪个 feed"的语义约束。因此标签视图不做 feed 优先级过滤。
+
+### 13.2 侧栏统计与列表查询的对称性验证
+
+| 视图 | 侧栏统计方法 | 列表查询方法 | 优先级过滤 | 对称？ |
+|------|------------|------------|-----------|--------|
+| 收藏 `s` | `countUnreadReadFavorites()` → `JOIN _feed WHERE f.priority > -10` | `sqlListWhere('s')` → `f.priority > -10 AND e.is_favorite=1` | 都 `> -10` | ✅ |
+| 标签 `t_*` | `TagDAO::countNotRead($id)` → `JOIN _entry WHERE is_read=0` | `sqlListWhere('t')` → `et.id_tag=?` | 都无过滤 | ✅ |
+| 全标签 `T` | `TagDAO::countNotRead()` → 同上 | `sqlListWhere('T')` → `1=1` | 都无过滤 | ✅ |
+
+**结论**：虽然收藏和标签对隐藏来源的处理逻辑不同，但**各自的侧栏统计与列表查询是严格对称的**。侧栏的数字永远等于进入对应视图后实际能看到的条目数。
+
+### 13.3 边缘场景：隐藏来源的文章同时被打标签和被收藏
+
+假设一篇隐藏来源的文章同时被打标签和被收藏：
+
+| 操作 | 侧栏收藏数 | 侧栏标签未读数 | 收藏视图 | 标签视图 |
+|------|-----------|-------------|---------|---------|
+| 该文章被收藏 | ❌ 不变（排除隐藏来源） | — | ❌ 看不到 | — |
+| 该文章被打标签 | — | ✅ +1（包含隐藏来源） | — | ✅ 能看到 |
+| 在标签视图标为已读 | — | ✅ -1 | — | ✅ 显示为已读 |
+| 在 `Z` 视图搜 `is:starred` | — | — | — | —（搜索不走 `s` 视图） |
+| 在 `Z` 视图直接看到并取消收藏 | ✅ 无变化（本就不在统计中） | — | ❌ 仍然看不到 | — |
+
+**关键观察**：隐藏来源的收藏文章在 `get=s` 下既看不到也无法操作。用户只能在 `get=Z` 或直接访问文章链接时才能管理这些收藏。这是刻意的设计——隐藏来源的文章不应出现在"正常"视图中，即使被收藏。
+
+---
+
+## 十四、侧栏渲染的隐藏与显示逻辑
+
+侧栏不仅决定**显示什么数字**，还决定**哪些 feed/category 节点可见**、**数字徽章是否显示**。
+
+### 14.1 `hide_read_feeds`：隐藏已读完的 feed 节点
+
+[aside_feed.phtml L6-L9](file:///d:/fz/0601-1/solo-dogfeeding/code/23-FreshRSS/app/layout/aside_feed.phtml#L6-L9)：
+
+```php
+if (FreshRSS_Context::userConf()->hide_read_feeds &&
+    (FreshRSS_Context::isStateEnabled(FreshRSS_Entry::STATE_NOT_READ) ||
+     FreshRSS_Context::isStateEnabled(FreshRSS_Entry::STATE_OR_NOT_READ)) &&
+    !FreshRSS_Context::isStateEnabled(FreshRSS_Entry::STATE_READ)) {
+    $class = ' state_unread';
+}
+```
+
+三个条件同时满足时，`<nav>` 获得额外 class `state_unread`：
+1. 用户开启 `hide_read_feeds` 配置
+2. 当前 state 过滤**包含**未读（`STATE_NOT_READ` 或 `STATE_OR_NOT_READ` 位被设）
+3. 当前 state 过滤**不包含**已读（`STATE_READ` 位未设）
+
+CSS 规则 `.state_unread .feed[data-unread="0"]` 会隐藏 `data-unread=0` 的 feed 节点。
+
+**进入收藏/标签视图时的联动**：当 `show_fav_unread=true` 时，进入收藏/标签视图会自动设置 `state = STATE_NOT_READ | STATE_READ`，此时条件 3 不满足（`STATE_READ` 已设），因此 `state_unread` class **不会被添加**——所有 feed 节点都保持可见。这是合理的：收藏/标签视图显示全部文章，侧栏也应展示所有 feed 供导航。
+
+当 `show_fav_unread=false` 且 `default_view='adaptive'` 时，进入收藏视图的 state 仍然是 `STATE_NOT_READ`（条件 3 满足），但收藏视图本身不按 feed 展示，侧栏 feed 节点的隐藏不影响内容区域。
+
+### 14.2 `show_unread_count`：控制数字徽章的三级显示
+
+[aside_feed.phtml L23-L24](file:///d:/fz/0601-1/solo-dogfeeding/code/23-FreshRSS/app/layout/aside_feed.phtml#L23-L24)：
+
+```php
+$hideSucGlobal = userConf()->show_unread_count !== 'all' ? ' data-unread-hide="1"' : '';
+$hideSucImportant = userConf()->show_unread_count !== 'none' ? '' : ' data-unread-hide="1"';
+```
+
+| `show_unread_count` 值 | 主流/全部/收藏/标签 数字 | 重要 feed 数字 |
+|------------------------|----------------------|--------------|
+| `'all'` | ✅ 显示 | ✅ 显示 |
+| `'important'` | ❌ 隐藏 | ✅ 显示 |
+| `'none'` | ❌ 隐藏 | ❌ 隐藏 |
+
+per-feed 和 per-category 的 `show_unread_count` 覆盖：
+- [Feed.php L321-L330](file:///d:/fz/0601-1/solo-dogfeeding/code/23-FreshRSS/app/Models/Feed.php#L321-L330)：`$feed->showUnreadCount()` 检查 feed 自身属性 → category 属性 → 全局配置
+- [aside_feed.phtml L109/L148](file:///d:/fz/0601-1/solo-dogfeeding/code/23-FreshRSS/app/layout/aside_feed.phtml#L109)：`$hideSucCat = $cat->showUnreadCount() ? '' : ' data-unread-hide="1"'`
+
+**收藏夹伪分类的数字**使用 `$hideSucGlobal`（全局规则），不受 per-feed/per-category 覆盖影响——因为它不是真正的 feed/category。
+
+### 14.3 侧栏收藏夹的特殊渲染
+
+[aside_feed.phtml L57-L63](file:///d:/fz/0601-1/solo-dogfeeding/code/23-FreshRSS/app/layout/aside_feed.phtml#L57-L63)：
+
+```php
+<li class="tree-folder category favorites<?= FreshRSS_Context::isCurrentGet('s') ? ' active' : '' ?>">
+    <a class="tree-folder-title" data-unread="<?= format_number(FreshRSS_Context::$total_starred['unread']) ?>"<?=
+        $hideSucGlobal ?> href="<?= _url('index', $actual_view, 'get', 's') . $state_filter_manual ?>">
+        <?= _i('starred') ?><span class="title" data-unread="<?= format_number(FreshRSS_Context::$total_starred['unread']) ?>"<?=
+            $hideSucGlobal ?>><?= _t('index.menu.favorites', format_number(FreshRSS_Context::$total_starred['all'])) ?></span>
+    </a>
+</li>
+```
+
+关键细节：
+- `data-unread` 使用 `$total_starred['unread']`（收藏中的未读数）
+- 标签文本使用 `_t('index.menu.favorites', $total_starred['all'])`（收藏总数）
+- `<a>` 和 `<span>` 都有独立的 `data-unread` 属性——JS `incLabel()` 更新 `.favorites .title` 的 `data-unread` 和文本
+- 链接 href 不带 `state` 参数（使用 `$state_filter_manual`，不含自动调整后的 state），让 Context 自动调整逻辑在点击时生效
+- 收藏夹没有子节点（不像 category 有 feed 列表），是扁平的"虚拟分类"
+
+### 14.4 `Category::feeds()` 初始化时的 `nbNotRead` 过滤
+
+[Category.php L131-L147](file:///d:/fz/0601-1/solo-dogfeeding/code/23-FreshRSS/app/Models/Category.php#L131-L147)：
+
+```php
+public function feeds(): array {
+    if ($this->feeds === null) {
+        $feedDAO = FreshRSS_Factory::createFeedDao();
+        $this->feeds = $feedDAO->listByCategory($this->id());
+        $this->nbFeeds = 0;
+        $this->nbNotRead = 0;
+        foreach ($this->feeds as $feed) {
+            $this->nbFeeds++;
+            if ($feed->priority() > FreshRSS_Feed::PRIORITY_HIDDEN) {
+                $this->nbNotRead += $feed->nbNotRead();
+            }
+        }
+    }
+    return $this->feeds ?? [];
+}
+```
+
+**关键**：`Category::feeds()` 自动加载时，累加 `nbNotRead` 的条件是 `$feed->priority() > PRIORITY_HIDDEN`（即 `> -10`）。这意味着：
+- 分类的 `nbNotRead` **默认排除隐藏来源**
+- 与侧栏显示的分类未读数一致
+- 但 `$this->feeds` 数组**包含**隐藏来源的 feed 对象（只是不计入未读数）
+
+这与 `Category::nbNotRead($minPriority)` 传入不同参数时的行为不同：`nbNotRead()` 无参数默认使用 `PRIORITY_FEED (-5)`，比 `feeds()` 中的 `> PRIORITY_HIDDEN (-10)` 更严格。但 `feeds()` 懒加载缓存的 `$this->nbNotRead` 只在 `$minPriority === PRIORITY_FEED` 时返回缓存值，否则重新查询。
+
+### 14.5 侧栏 feed 节点的优先级过滤
+
+[aside_feed.phtml L129-L131](file:///d:/fz/0601-1/solo-dogfeeding/code/23-FreshRSS/app/layout/aside_feed.phtml#L129-L131)：
+
+```php
+if (!$f_active && $feed->priority() < FreshRSS_Feed::PRIORITY_FEED) {
+    continue;
+}
+```
+
+**非当前激活的 feed**，如果 `priority < -5`（即 `PRIORITY_HIDDEN = -10`），侧栏直接**跳过不渲染**。只有当前激活的隐藏 feed 才会在侧栏显示。
+
+这解释了为什么隐藏来源的 feed 在正常情况下不可见——侧栏 HTML 中根本不存在这些节点，JS 也无法操作它们。只有通过直接 URL 访问或搜索才能触达。
+
+---
+
+## 十五、`show_fav_unread` 配置的完整影响链
+
+这个配置项是连接"侧栏统计"和"列表回显"的关键桥梁，其影响贯穿整个请求生命周期。
+
+### 15.1 配置定义
+
+[config-user.default.php L35](file:///d:/fz/0601-1/solo-dogfeeding/code/23-FreshRSS/config-user.default.php#L35)：
+
+```php
+'show_fav_unread' => false,  // 默认关闭
+```
+
+帮助文本（中文）：_"同样适用于标签"_ — 说明此配置同时影响收藏视图和标签视图。
+
+### 15.2 影响链路图
+
+```
+用户配置 show_fav_unread = true
+│
+├─→ Context::updateUsingRequest() [L253]
+│   ├─ 当前 get='s'/'T'/t_* 且用户未指定 ?state=
+│   └─ $state = STATE_NOT_READ | STATE_READ (=3, 显示全部)
+│
+├─→ sqlListEntriesWhere($state=3)
+│   └─ STATE_NOT_READ 和 STATE_READ 同时为 true → 不生成 is_read 条件
+│   └─ 如果 get='s': $state |= STATE_FAVORITE → 最终 state=7 → AND is_favorite=1
+│   └─ 如果 get='t_*': $state=3 → 不生成 is_read 条件（显示标签下全部）
+│
+├─→ aside_feed.phtml [L6-L9]
+│   └─ state=3 包含 STATE_READ → 不添加 state_unread class
+│   └─ 侧栏所有 feed 节点保持可见（不受 hide_read_feeds 影响）
+│
+└─→ 用户体验
+    ├─ 进入收藏视图 → 看到所有收藏（含已读）→ 符合"知识库"预期
+    ├─ 进入标签视图 → 看到所有标签文章（含已读）→ 符合"知识库"预期
+    └─ 进入主视图 → state 不被 show_fav_unread 影响 → 仍按 default_view 规则
+```
+
+### 15.3 `show_fav_unread = false` 时的行为
+
+当配置关闭时，进入收藏/标签视图**不会**自动切换到"显示全部"。此时 state 仍按 `default_view` 规则处理：
+
+| `default_view` | state 值 | 收藏视图显示 | 标签视图显示 |
+|----------------|---------|------------|------------|
+| `adaptive`（有未读） | `STATE_NOT_READ` (2) | 仅未读收藏 | 仅未读标签文章 |
+| `adaptive`（无未读） | `STATE_NOT_READ \| STATE_READ` (3) | 全部收藏 | 全部标签文章 |
+| `all` | 3 | 全部收藏 | 全部标签文章 |
+| `unread_or_favorite` | 96 | 未读或收藏 | 未读或收藏 |
+
+**典型困惑场景**：用户 `default_view='adaptive'`、`show_fav_unread=false`，进入收藏视图时如果收藏中有未读条目，只看到未读的收藏文章。用户以为收藏丢了，但其实已读的收藏只是被过滤掉了。开启 `show_fav_unread` 即可解决。
+
+### 15.4 与侧栏收藏未读数的联动
+
+侧栏收藏夹的 `data-unread` 始终显示 `$total_starred['unread']`（收藏中的未读数），与 `show_fav_unread` 无关。
+
+但 `show_fav_unread` 间接影响"全部标已读"按钮的可见性：
+
+[stream-footer.phtml](file:///d:/fz/0601-1/solo-dogfeeding/code/23-FreshRSS/app/views/helpers/stream-footer.phtml) 中 `toggle_bigMarkAsRead_button()` JS 函数根据当前 `get_unread` 值决定按钮显示/隐藏。进入收藏视图时 `get_unread = total_starred['unread']`。当所有收藏都已读时，`get_unread = 0`，按钮自动隐藏——无论 `show_fav_unread` 如何配置。
+
+---
+
+## 十六、侧栏计数与列表回显一致性的完整保障矩阵
+
+综合以上所有分析，一致性由以下六条规则保障：
+
+| 规则 | 机制 | 影响范围 |
+|------|------|---------|
+| **统计-查询对称** | 侧栏 COUNT 的 WHERE 条件与 `sqlListWhere()` 的 WHERE 条件使用相同的优先级阈值 | 收藏、标签、分类、feed、全局 |
+| **渲染同源** | 模板从同一个 `FreshRSS_Context` 静态属性和 `Entry` 模型取值 | 所有视图 |
+| **整页刷新兜底** | 批量操作（全部标已读）走 302 重定向，所有状态从数据库重新读取 | 批量标读 |
+| **AJAX 全量更新** | `querySelectorAll('a.read/a.bookmark')` 更新同一 flux 内所有按钮 | 单篇切换 |
+| **非乐观更新** | 服务器确认后才切换 DOM class / href / icon，失败则回滚 | 所有 AJAX 操作 |
+| **增量计数收敛** | JS 增量更新（±1）与 PHP 全量计算（COUNT）在下次刷新时自然对齐 | 侧栏计数 |
+
+唯一的"设计性不一致"：**搜索场景**。`needVisibility()` 会动态下调优先级下限，导致搜索结果可能包含侧栏统计中不存在的隐藏来源条目。这不是 bug，而是搜索语义决定的——用户明确搜索某 feed 时，理应看到该 feed 的内容。
