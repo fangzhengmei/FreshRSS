@@ -3,15 +3,12 @@
 ## 目录
 
 1. [CLI 命令概览](#cli-命令概览)
-2. [全量刷新的多入口体系](#全量刷新的多入口体系)
-3. [命令解析机制](#命令解析机制)
-4. [用户上下文管理](#用户上下文管理)
-5. [日志记录机制](#日志记录机制)
-6. [并发风险与锁机制](#并发风险与锁机制)
-7. [核心刷新命令详解](#核心刷新命令详解)
-8. [用户维护钩子的调用时机](#用户维护钩子的调用时机)
-9. [数据库维护命令详解](#数据库维护命令详解)
-10. [并行互斥保护缺失矩阵](#并行互斥保护缺失矩阵)
+2. [命令解析机制](#命令解析机制)
+3. [用户上下文管理](#用户上下文管理)
+4. [日志记录机制](#日志记录机制)
+5. [并发风险与锁机制](#并发风险与锁机制)
+6. [核心刷新命令详解](#核心刷新命令详解)
+7. [数据库维护命令详解](#数据库维护命令详解)
 
 ---
 
@@ -340,9 +337,144 @@ $feedDAO->commit();
 | 用户配置并发修改 | 会话锁 + 文件锁 | 中 |
 | HTTP 缓存失效并发 | 无特殊保护 | 低 |
 
+### 各命令/入口的互斥保护缺失矩阵
+
+上面列出的是通用的并发风险。如果聚焦到**单用户刷新、清理、库优化、全量刷新**这几个维护命令之间的并行关系，会发现它们在上层几乎没有统一互斥保护——只有最底层的 Feed 级锁和数据库事务是共享的。
+
+#### 命令保护对照表
+
+| 命令/入口 | 全局刷新锁 | 用户级互斥锁 | Feed 级锁 | 数据库事务 | 数据库优化锁 | 并发写入保护 |
+|----------|----------|-----------|----------|----------|-----------|-----------|
+| **actualize_script.php（全量刷新）** | ✅ 有 | ✅ 间接（全局锁） | ✅ 有 | ✅ 有 | ❌ 无 | ✅ LOCK_EX |
+| **actualize-user.php（单用户刷新）** | ❌ **无** | ❌ **无** | ✅ 有 | ✅ 有 | ❌ 无 | ✅ LOCK_EX |
+| **purge.php（清理旧条目）** | ❌ **无** | ❌ **无** | ❌ **无** | ✅ 有 | ❌ 无 | ✅ LOCK_EX |
+| **db-optimize.php（库优化）** | ❌ **无** | ❌ **无** | ❌ **无** | ❌ **无** | ❌ **无** | ✅ LOCK_EX |
+| feedAction（Web 刷新） | ❌ **无** | ❌ **无** | ✅ 有 | ✅ 有 | ❌ 无 | ✅ LOCK_EX |
+| JS 轮询（仅维护） | ❌ **无** | ❌ **无** | N/A | ❌ 无 | ❌ 无 | ✅ LOCK_EX |
+| WebSub pshb.php | ❌ **无** | ❌ **无** | ✅ 有 | ✅ 有 | ❌ 无 | ✅ LOCK_EX |
+| greader API 导入 | ❌ **无** | ❌ **无** | ✅ 有 | ✅ 有 | ❌ 无 | ✅ LOCK_EX |
+
+#### 四个核心命令缺少的统一互斥保护逐项分析
+
+##### 1. actualize-user.php（单用户刷新）缺少的保护
+
+- **不检查全局刷新锁**：`actualize_script.php` 持有 `actualize.freshrss.lock` 全局锁时，`actualize-user.php` 可以无视它直接运行，两个进程可能同时刷新同一用户的 feed（靠 Feed 级锁兜底，不同 feed 仍会并行造成资源浪费）
+- **无用户级互斥锁**：两个 `actualize-user.php --user alice` 进程可以同时跑
+
+##### 2. purge.php（清理旧条目）缺少的保护
+
+- **不检查全局刷新锁**：全量刷新运行时可以同时执行清理
+- **无用户级互斥锁**：可与同一用户的刷新、优化并行
+- **无 Feed 级锁**：清理某个 feed 的旧条目时，该 feed 可能正在被刷新，写入和删除同时操作 `_entry` 表
+
+##### 3. db-optimize.php（库优化）缺少的保护
+
+- **不检查全局刷新锁**：全量刷新运行时可以同时执行优化
+- **无用户级互斥锁**：可与同一用户的刷新、清理并行
+- **无数据库级保护**：
+  - MySQL：`OPTIMIZE TABLE` 会隐式锁表，但脚本本身不做前置检查
+  - SQLite：`VACUUM` 需要独占写锁，与任何写入并发都会导致 `database is locked` 错误
+- **无事务**：优化操作本身不在事务中
+
+##### 4. actualize_script.php（全量刷新）的相对完备
+
+- 这是**唯一**具备全局互斥锁的入口
+- 但该锁只防止自身重复执行，不被其他任何命令/入口检查
+- 与 `purge.php`、`db-optimize.php` 同时运行时，靠数据库事务和行锁兜底
+
+#### 典型并行冲突场景
+
+| 并行组合 | 现象 | 后果 | 风险等级 |
+|---------|------|------|---------|
+| **actualize-user + actualize_script** | 全量刷新持有全局锁，但单用户刷新不检查 | 两进程同时刷新同一用户，依赖 Feed 级锁（同 feed 串行、不同 feed 并行） | 中 |
+| **purge + db-optimize** | 两者均无用户级锁，同时操作同一数据库 | MySQL `OPTIMIZE TABLE` 锁表阻塞 purge；SQLite `VACUUM` 与写入冲突报错 | **高** |
+| **purge + actualize-\*** | 同操作 `_entry` 表不同行范围 | 功能基本安全，但事务持有时间变长，增加死锁概率 | 中 |
+| **actualize-user + actualize-user** | 同用户无互斥锁 | 同一用户多个刷新进程并行，数据库连接压力倍增 | 中 |
+| **WebSub + actualize_script** | 两条路径同时刷新同一 feed | Feed 级锁有效保护，后到的请求跳过 | 低 |
+
+#### 缺失保护的完整建议列表
+
+| 缺失项 | 影响的命令 | 建议补充的保护 |
+|-------|----------|--------------|
+| **单用户级互斥锁** | actualize-user、feedAction、purge、db-optimize | 在用户目录创建 `{username}.maintenance.lock` |
+| **actualize-user 检查全局锁** | actualize-user.php | 读取 `actualize.freshrss.lock` 并检查 TTL，锁存在时退出 |
+| **db-optimize 用户级锁** | db-optimize.php | 优化期间阻止其他读写操作 |
+| **purge Feed 级锁** | purge.php | 清理 feed 时对该 feed 加锁，避免与刷新冲突 |
+| **WebSub 检查全局锁** | pshb.php | 全局刷新运行时延迟处理推送，存入 Retry-After |
+| **跨入口统一协调层** | 所有入口 | 抽象刷新/维护调度层，统一管理锁与优先级 |
+
+#### SQLite 的特殊风险
+
+SQLite 采用文件级写锁（单写多读模型），以下操作在 SQLite 后端下并发风险显著高于 MySQL/PostgreSQL：
+
+- `db-optimize.php` 执行 `VACUUM` 需要独占写锁，会阻塞所有其他数据库操作
+- `purge.php` 的批量 DELETE 会长时间持有写锁
+- 多个用户并发刷新时，SQLite 串行化所有写操作，性能急剧下降
+
+**建议**：SQLite 后端避免并行执行任何维护命令，使用 `flock` 或任务队列串行化。
+
 ---
 
 ## 核心刷新命令详解
+
+### 全量刷新的多入口体系——不只是 CLI 脚本
+
+在展开具体命令之前，需要先明确：刷新订阅**不是只有两组 CLI 脚本**。FreshRSS 实际包含 **6 类独立入口**，它们共用最底层的 `actualizeFeeds()` 函数和 Feed 级锁，但上层没有统一的互斥协调。
+
+#### 6 类入口全景
+
+| 入口类型 | 入口文件/类 | 触发方式 | 触发对象 | 是否有全局锁 | 是否有用户级锁 |
+|---------|-----------|---------|---------|------------|--------------|
+| **CLI 全量脚本** | [actualize_script.php](file:///d:/fz/0601-1/solo-dogfeeding/code/30-FreshRSS/app/actualize_script.php) | Cron / 手动 | 所有用户 | ✅ 有 | 间接（通过全局锁） |
+| **CLI 单用户** | [actualize-user.php](file:///d:/fz/0601-1/solo-dogfeeding/code/30-FreshRSS/cli/actualize-user.php) | 手动 / 脚本 | 指定用户 | ❌ 无 | ❌ 无 |
+| **Web 在线 Cron** | [feedController::actualizeAction()](file:///d:/fz/0601-1/solo-dogfeeding/code/30-FreshRSS/app/Controllers/feedController.php#L954-L1033) | HTTP 请求 `?c=feed&a=actualize` | 当前用户 | ❌ 无 | ❌ 无 |
+| **Web JavaScript 轮询** | [javascriptController::actualizeAction()](file:///d:/fz/0601-1/solo-dogfeeding/code/30-FreshRSS/app/Controllers/javascriptController.php#L21-L42) | AJAX 后台轮询 | 当前用户 | ❌ 无 | ❌ 无 |
+| **Google Reader API** | [greader.php](file:///d:/fz/0601-1/solo-dogfeeding/code/30-FreshRSS/p/api/greader.php#L325-L332) | API 订阅导入后 | 当前用户 | ❌ 无 | ❌ 无 |
+| **WebSub 实时推送** | [pshb.php](file:///d:/fz/0601-1/solo-dogfeeding/code/30-FreshRSS/p/api/pshb.php#L140-L168) | 外部 Hub 推送 | 订阅该 feed 的所有用户 | ❌ 无 | ❌ 无 |
+
+#### 入口间调用关系
+
+```
+                    ┌─────────────────────────┐
+                    │  actualize_script.php   │── Cron
+                    │  (全局互斥锁 + 多用户)  │
+                    └───────────┬─────────────┘
+                                │ 模拟 Web 请求
+                                ▼
+                    ┌─────────────────────────┐
+CLI 手动 ──────────▶│ actualize-user.php      │── 两次维护钩子
+                    │  (直接函数调用)         │
+                    └───────────┬─────────────┘
+                                │
+          ┌─────────────────────┼─────────────────────┐
+          ▼                     ▼                     ▼
+┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐
+│ feedController   │  │ javascriptCtrl   │  │ WebSub pshb.php  │
+│ actualizeAction  │  │ (仅维护钩子)     │  │ (推送多用户)     │
+└──────────┬───────┘  └──────────────────┘  └──────────────────┘
+           │
+           ▼
+┌──────────────────────────────┐
+│ actualizeFeedsAndCommit()    │
+│ + Feed 级锁（所有入口共享）  │
+└──────────┬───────────────────┘
+           ▲
+           │
+┌──────────┴──────────────┐
+│ greader API import 后  │
+│ 自动调用刷新            │
+└────────────────────────┘
+```
+
+各入口关键差异：
+- **actualize_script.php**：唯一拥有全局互斥锁的入口，通过模拟 Web 请求走 MVC 路由调用 `actualizeAction()`
+- **actualize-user.php**：不走 MVC 路由，直接调用底层核心函数，在 `minorDbMaintenance()` 前后**两次**触发维护钩子
+- **feedController::actualizeAction()**：Web/在线 Cron 入口，只在 `minorDbMaintenance()` 后触发一次钩子，支持 `id/url/maxFeeds` 参数
+- **javascriptController::actualizeAction()**：浏览器 AJAX 轮询入口，**不实际刷新 feed**，只执行维护钩子和 minorDbMaintenance，返回 feed 更新时间排序供前端决策
+- **WebSub pshb.php**：唯一被动入口，接收外部 Hub 推送的 XML，一次推送可刷新多个用户的同一 feed
+- **greader API**：OPML 导入成功后自动触发，不经过维护钩子和数据库维护
+
+---
 
 ### actualize-user.php - 单用户刷新
 
@@ -351,22 +483,61 @@ $feedDAO->commit();
 **参数：**
 - `--user` (必填)：用户名
 
-**执行流程：**
+**执行流程（精确代码顺序 + 两次维护钩子的前后关系）：**
 
-1. 检查系统需求
-2. 初始化用户上下文
-3. 触发用户维护钩子：`Minz_ExtensionManager::callHookVoid(FreshrssUserMaintenance)`
+1. 检查系统需求：`performRequirementCheck()`
+2. 初始化用户上下文：`cliInitUser($cliOptions->user)`
+3. **第 1 次触发用户维护钩子**（`minorDbMaintenance` **之前**）：`callHookVoid(Minz_HookType::FreshrssUserMaintenance)` — [第 23 行](file:///d:/fz/0601-1/solo-dogfeeding/code/30-FreshRSS/cli/actualize-user.php#L23)
 4. 执行轻量数据库维护：`$databaseDAO->minorDbMaintenance()`
-5. 提交暂存新条目：`FreshRSS_feed_Controller::commitNewEntries()`
-6. 更新 Feed 缓存值：`$feedDAO->updateCachedValues()`
-7. 刷新动态 OPML：`FreshRSS_category_Controller::refreshDynamicOpmls()`
-8. 执行实际 Feed 刷新：`FreshRSS_feed_Controller::actualizeFeedsAndCommit()`
-9. 失效 HTTP 缓存：`invalidateHttpCache($username)`
-10. 输出结果并退出
+5. **第 2 次触发用户维护钩子**（`minorDbMaintenance` **之后**）：`callHookVoid(Minz_HookType::FreshrssUserMaintenance)` — [第 29 行](file:///d:/fz/0601-1/solo-dogfeeding/code/30-FreshRSS/cli/actualize-user.php#L29)
+6. 提交暂存新条目：`FreshRSS_feed_Controller::commitNewEntries()`
+7. 更新 Feed 缓存值：`$feedDAO->updateCachedValues()`
+8. 刷新动态 OPML：`FreshRSS_category_Controller::refreshDynamicOpmls()`
+9. 执行实际 Feed 刷新：`FreshRSS_feed_Controller::actualizeFeedsAndCommit()`
+10. 失效 HTTP 缓存：`invalidateHttpCache($username)`
+11. 输出结果并退出：`done($nbUpdatedFeeds > 0)`
+
+**两次维护钩子的前后顺序与各入口对比：**
+
+这是 `actualize-user.php` **独有的行为**。所有入口的钩子调用情况对比如下：
+
+| 入口 | 钩子调用次数 | 调用位置相对 minorDbMaintenance |
+|-----|------------|------------------------------|
+| **actualize-user.php** | **2 次** | **之前 1 次 + 之后 1 次** |
+| actualize_script.php（via actualizeAction） | 1 次 | 之后（[feedController.php:971](file:///d:/fz/0601-1/solo-dogfeeding/code/30-FreshRSS/app/Controllers/feedController.php#L971)） |
+| Web 在线 cron（actualizeAction） | 1 次 | 之后 |
+| JavaScript 轮询（javascriptController） | 1 次 | 之后（[javascriptController.php:35](file:///d:/fz/0601-1/solo-dogfeeding/code/30-FreshRSS/app/Controllers/javascriptController.php#L35)） |
+| greader API、WebSub、purge、db-optimize | 0 次 | 不触发 |
+
+代码对照：
+
+```php
+// cli/actualize-user.php - 独有两次调用模式
+Minz_ExtensionManager::callHookVoid(Minz_HookType::FreshrssUserMaintenance);  // 第 1 次：之前
+$databaseDAO->minorDbMaintenance();
+Minz_ExtensionManager::callHookVoid(Minz_HookType::FreshrssUserMaintenance);  // 第 2 次：之后
+
+// app/Controllers/feedController.php + javascriptController.php - 标准一次调用模式
+$databaseDAO = FreshRSS_Factory::createDatabaseDAO();
+$databaseDAO->minorDbMaintenance();
+Minz_ExtensionManager::callHookVoid(Minz_HookType::FreshrssUserMaintenance);  // 仅之后
+```
+
+推测两次钩子的设计意图：
+- **第 1 次（之前）**：允许扩展在数据库 schema 更新前做准备/迁移工作
+- **第 2 次（之后）**：允许扩展在 schema 更新后执行依赖新结构的维护任务
+
+对扩展开发者的实际影响：
+1. 扩展需自行确保幂等性——`actualize-user.php` 钩子会跑两次，Web 入口只跑一次
+2. 如果主要更新渠道是 WebSub 或 greader API，维护钩子可能**永不执行**
+3. 用户每打开一次 Web 页面，JS 轮询就会触发一次钩子，可能执行过于频繁
+4. `purge.php` 和 `db-optimize.php` 虽修改数据库，但不通知扩展
 
 **返回值：**
 - 退出码 0：有 feed 被更新
 - 退出码 1：无 feed 更新或出错
+
+---
 
 ### actualize_script.php - 全量刷新脚本
 
@@ -394,6 +565,8 @@ $feedDAO->commit();
    - 触发垃圾回收：`gc_collect_cycles()`
 6. 输出总览统计（用户数、内存峰值、耗时）
 
+---
+
 ### actualizeFeeds() 核心刷新逻辑
 
 [`FreshRSS_feed_Controller::actualizeFeeds()`](file:///d:/fz/0601-1/solo-dogfeeding/code/30-FreshRSS/app/Controllers/feedController.php#L420-L900)
@@ -418,6 +591,8 @@ $feedDAO->commit();
 8. 随机触发旧条目清理（1/30 概率）
 9. 更新 feed 的 `lastUpdate` 时间
 10. 释放 feed 锁
+
+---
 
 ### actualizeFeedsAndCommit() 提交逻辑
 
