@@ -2,23 +2,36 @@
 
 ## 一、触发入口矩阵
 
-FreshRSS 通过以下 **8 个独立触发入口** 触发 Feed 刷新 / 条目入库，外加 **2 个阅读器 API 调用渠道**（§1.9，映射到上述入口）：
+FreshRSS 通过以下 **10 个独立执行入口** 触发 Feed 刷新 / 条目入库。独立入口的判断标准：
+- 有 **独立的文件入口**（独立 `.php` 文件）或 Web MVC 下 **独立的 Controller Action**
+- 有 **独立的鉴权机制**
+- 有 **独立的参数解析**
+- 直接发起刷新/入库请求
 
-| 编号 | 入口名称 | 核心调用 | 独立性 |
-|------|---------|---------|--------|
-| 1.1 | Web UI 手动刷新 | `actualizeAction()` | ✅ 独立入口 |
-| 1.2 | 添加 Feed 时首次刷新 | `addFeed()` → `actualizeFeedsAndCommit(id)` | ✅ 独立入口 |
-| 1.3 | 系统级 CLI 全量刷新 (Cron) | `actualize_script.php` | ✅ 独立入口 |
-| 1.4 | 单用户 CLI 刷新 | `actualize-user.php` | ✅ 独立入口 |
-| 1.5 | WebSub 实时推送 | `pshb.php` | ✅ 独立入口 |
-| 1.6 | JavaScript 后台自动刷新 | AJAX 轮询 `actualizeAction` | ✅ 独立入口 |
-| 1.7 | 导入订阅批量入库 | `importFile()` / `importJson()` | ✅ 独立入口 |
-| 1.8 | 重新抓取 (Reload Articles) | `reloadAction()` → 强制刷新 + 全文重抓 | ✅ 独立入口 |
-| 1.9 | 阅读器 API 渠道 | GReader API / Fever API | ⚠️ 调用渠道，映射到 1.2 / 1.7 |
+同一独立入口内可包含多个**端点（调用渠道）**，通过路由参数分派到不同内部函数。
 
-> **分类说明**：
-> - **独立入口**：代码位置、调用方式、参数组合有显著差异，直接发起刷新/入库请求
-> - **调用渠道**：通过 API 间接调用，最终映射到上述独立入口（如 GReader quickadd → addFeed → 1.2）
+| 编号 | 入口类型 | 独立入口 | 鉴权方式 | 内部端点 / 调用渠道 | 是否触发刷新 | 核心内部调用 |
+|------|---------|---------|---------|-------------------|------------|------------|
+| 1.1 | Web MVC Action | `actualizeAction` | Session | （单端点） | ✅ | `actualizeFeedsAndCommit()` |
+| 1.2 | Web MVC Action | `addAction` → `addFeed()` | Session | （单端点） | ✅ | `addFeed()` 内置 `actualizeFeedsAndCommit(id,url)` |
+| 1.3 | CLI Script | [actualize_script.php](file:///d:/fz/0601-1/solo-dogfeeding/code/21-FreshRSS/app/actualize_script.php) | 无（CLI） | （单端点） | ✅ | 模拟路由 → `actualizeAction` + 全局锁 |
+| 1.4 | CLI Script | [actualize-user.php](file:///d:/fz/0601-1/solo-dogfeeding/code/21-FreshRSS/cli/actualize-user.php) | 无（CLI） | （单端点） | ✅ | 直接 `actualizeFeedsAndCommit()` |
+| 1.5 | API Script | [pshb.php](file:///d:/fz/0601-1/solo-dogfeeding/code/21-FreshRSS/p/api/pshb.php) | `?k=xxx` 密钥 | （单端点） | ✅ | `actualizeFeedsAndCommit(feed_url, simplePiePush)` |
+| 1.6 | Web MVC Action | `reloadAction` | Session | （单端点） | ✅ | `lastUpdate=0` + `actualizeFeedsAndCommit(id)` + 全文重抓 |
+| 1.7 | Web MVC Action + CLI | `importAction` / [import-for-user.php](file:///d:/fz/0601-1/solo-dogfeeding/code/21-FreshRSS/cli/import-for-user.php) | Session / 无 | （单端点） | ⚠️ 仅导入条目时刷新，导入 OPML Feed 列表不刷新 | `importFile()` → `importJson()` |
+| 1.8 | API Script | [greader.php](file:///d:/fz/0601-1/solo-dogfeeding/code/21-FreshRSS/p/api/greader.php) | `?auth=xxx` / Session | **端点 1**：`subscription/import` | ✅ 全量刷新 | `ImportService::importOpml` + `actualizeFeedsAndCommit()` |
+| | | | | **端点 2**：`subscription/quickadd` | ✅ 同步刷新 | `addFeed()` |
+| | | | | **端点 3**：`subscription/edit?ac=subscribe` | ✅ 同步刷新 | `addFeed()` |
+| | | | | **端点 4-10**：其他端点 | ❌ | 只读 / 改状态 / 删订阅 / 改分类 |
+| 1.9 | API Script | [fever.php](file:///d:/fz/0601-1/solo-dogfeeding/code/21-FreshRSS/p/api/fever.php) | `?api_key=xxx` | 所有端点 | ❌ | 只读，无订阅管理 |
+| 1.10 | JS 轮询 | `actualize.phtml` AJAX | Session | （单端点） | ✅ | 静默调用 `actualizeAction` |
+
+> **关键定义**：
+> - **独立入口**：可以被独立调用、有独立 URL 或 CLI 命令的执行点（共 10 个）
+> - **端点 / 调用渠道**：同一独立入口内，通过路由参数分派的不同业务逻辑（如 greader.php 内的 10 个端点）
+> - **内部函数**：`addFeed()`、`actualizeFeedsAndCommit()`、`ImportService::importOpml()` 等被多个入口复用的核心函数
+
+---
 
 ---
 
@@ -268,9 +281,9 @@ $entry->loadCompleteContent(true);
 
 ---
 
-### 1.9 阅读器同步 API（GReader API + Fever API）
+### 1.9 阅读器 API 渠道（GReader API + Fever API）
 
-FreshRSS 提供两套移动阅读器兼容 API，调用方式与刷新链路如下：
+FreshRSS 提供两套移动阅读器兼容 API，**本身不是独立入口**，而是通过调用内部函数映射到上述 8 个独立入口。
 
 #### 1.9.1 Google Reader API（[greader.php](file:///d:/fz/0601-1/solo-dogfeeding/code/21-FreshRSS/p/api/greader.php)）
 
