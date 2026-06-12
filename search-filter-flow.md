@@ -1028,12 +1028,18 @@ FreshRSS_FilterAction {
 
 **宿主对象**（均使用 [FilterActionsTrait.php](file:///d:/fz/0601-1/solo-dogfeeding/code/24-FreshRSS/app/Models/FilterActionsTrait.php)）：
 
-| 宿主 | 类 | 规则作用域 |
-|------|------|-----------|
-| 用户全局配置 | [UserConfiguration.php](file:///d:/fz/0601-1/solo-dogfeeding/code/24-FreshRSS/app/Models/UserConfiguration.php) | 所有 Feed 的条目 |
-| 分类 | [Category.php](file:///d:/fz/0601-1/solo-dogfeeding/code/24-FreshRSS/app/Models/Category.php) | 该分类下所有 Feed 的条目 |
-| 订阅源 | [Feed.php](file:///d:/fz/0601-1/solo-dogfeeding/code/24-FreshRSS/app/Models/Feed.php) | 仅该 Feed 的条目 |
-| 标签 | [Tag.php](file:///d:/fz/0601-1/solo-dogfeeding/code/24-FreshRSS/app/Models/Tag.php) | 自动打标签规则 |
+> 虽然 `FilterActionsTrait` 代码层面支持 `read`/`star`/`label` 三种动作，但每个宿主通过 UI 和 Controller 层**只开放了特定动作**的配置能力。
+
+| 宿主 | 类 | 规则作用域 | 可配置动作 | Controller 证据 |
+|------|------|-----------|-----------|----------------|
+| 用户全局配置 | [UserConfiguration.php](file:///d:/fz/0601-1/solo-dogfeeding/code/24-FreshRSS/app/Models/UserConfiguration.php) | 所有 Feed 的条目 | `read`、`star` | [configureController.php#L202-L203](file:///d:/fz/0601-1/solo-dogfeeding/code/24-FreshRSS/app/Controllers/configureController.php#L202-L203) |
+| 分类 | [Category.php](file:///d:/fz/0601-1/solo-dogfeeding/code/24-FreshRSS/app/Models/Category.php) | 该分类下所有 Feed 的条目 | `read` 仅 | [categoryController.php#L118](file:///d:/fz/0601-1/solo-dogfeeding/code/24-FreshRSS/app/Controllers/categoryController.php#L118) |
+| 订阅源 | [Feed.php](file:///d:/fz/0601-1/solo-dogfeeding/code/24-FreshRSS/app/Models/Feed.php) | 仅该 Feed 的条目 | `read` 仅 | [subscriptionController.php#L253](file:///d:/fz/0601-1/solo-dogfeeding/code/24-FreshRSS/app/Controllers/subscriptionController.php#L253) |
+| 标签 | [Tag.php](file:///d:/fz/0601-1/solo-dogfeeding/code/24-FreshRSS/app/Models/Tag.php) | 自动打标签规则 | `label` 仅 | [tagController.php#L121](file:///d:/fz/0601-1/solo-dogfeeding/code/24-FreshRSS/app/Controllers/tagController.php#L121) |
+
+**两条独立的执行链路**：
+- **链路 A**：User → Category → Feed 顺序链路 — 处理 `read` + `star`，条目入库时执行
+- **链路 B**：Tag 独立打标签链路 — 处理 `label`，条目提交后批量执行
 
 ### 9.2 搜索条件的复用方式——两条路径，同一模型
 
@@ -1117,11 +1123,11 @@ public function matches(FreshRSS_BooleanSearch $booleanSearch): bool {
 
 自动规则在两个关键时机触发：
 
-#### 9.3.1 条目入库时——标记已读/收藏
+#### 9.3.1 链路 A：User → Category → Feed 顺序链路（处理 read + star）
 
-[feedController.php#L703](file:///d:/fz/0601-1/solo-dogfeeding/code/24-FreshRSS/app/Controllers/feedController.php#L703)
+[Entry.php#L894-L918](file:///d:/fz/0601-1/solo-dogfeeding/code/24-FreshRSS/app/Models/Entry.php#L894-L918)
 
-当 Feed 刷新获取到新条目（或更新已有条目）时：
+当 Feed 刷新获取到新条目（或更新已有条目）时，在入库前逐条执行：
 
 ```
 Feed刷新 → 解析新条目 → Extension Hook (EntryBeforeInsert)
@@ -1134,6 +1140,7 @@ Feed刷新 → 解析新条目 → Extension Hook (EntryBeforeInsert)
 ① UserConf          ② Category        ③ Feed
   .applyFilterActions  .applyFilterActions  .applyFilterActions
   (全局规则)           (分类规则)         (Feed规则)
+  支持: read+star     支持: read 仅     支持: read 仅
           │               │               │
           └───────┬───────┘               │
                   ▼                       ▼
@@ -1151,10 +1158,10 @@ Feed刷新 → 解析新条目 → Extension Hook (EntryBeforeInsert)
       执行 actions:     跳过
       • 'read'  → entry._isRead(true)  （守卫：!isRead，首次生效）
       • 'star'  → entry._isFavorite(true)  （守卫：!isUpdated）
-      • 'label' → 设置 $applyLabel=true
-                   ⚠️ 但此三次调用均未传递 &$applyLabel 引用参数，
-                      label 结果在此路径被直接丢弃！
-                      label 的真实执行路径见 9.3.2
+
+  ⚠️ 此链路未传递 &$applyLabel 引用参数，且 User/Category/Feed
+     通过 UI 限制均不可配置 label 动作，因此 label 不在此链路生效。
+     label 的真实执行路径见 9.3.2 链路 B。
 ```
 
 [FilterActionsTrait.php#L125-L153](file:///d:/fz/0601-1/solo-dogfeeding/code/24-FreshRSS/app/Models/FilterActionsTrait.php#L125-L153)
@@ -1195,63 +1202,91 @@ public function applyFilterActions(FreshRSS_Entry $entry, ?bool &$applyLabel = n
 从 [Entry.php#L915-L917](file:///d:/fz/0601-1/solo-dogfeeding/code/24-FreshRSS/app/Models/Entry.php#L915-L917) 开始：
 
 ```php
-FreshRSS_Context::userConf()->applyFilterActions($this);  // 第1层：全局规则
-$feed->category()?->applyFilterActions($this);          // 第2层：分类规则
-$feed->applyFilterActions($this);                       // 第3层：Feed规则
+FreshRSS_Context::userConf()->applyFilterActions($this);  // 第1层：全局规则（read + star）
+$feed->category()?->applyFilterActions($this);          // 第2层：分类规则（仅 read）
+$feed->applyFilterActions($this);                       // 第3层：Feed规则（仅 read）
 ```
 
 每次调用都独立进入 [FilterActionsTrait::applyFilterActions()](file:///d:/fz/0601-1/solo-dogfeeding/code/24-FreshRSS/app/Models/FilterActionsTrait.php#L125-L153)，遍历**该层级自身的** `filterActions()` 列表，与其他层级的规则列表完全隔离。
 
-#### 三种动作的守卫行为分析
+#### 链路 A 实际支持的动作与守卫行为
 
-| 动作类型 | 守卫条件 | 跨层级影响 | 语义 |
-|---------|---------|-----------|------|
-| `read` | `!$entry->isRead()` | ✅ 有影响 | 先执行的层级如果标记为已读，后续层级的 `read` 动作会被守卫跳过。**先到先得** |
-| `star` | `!$entry->isUpdated()` | ❌ 无影响 | `isUpdated()` 检查的是"条目是否已在数据库中存在并被更新过"，与自动规则执行无关。三个层级独立判断，效果累加 |
-| `label` | `!$entry->isUpdated()` | ❌ 无影响 | 同上，三个层级独立判断。但因此路径未传 `&$applyLabel` 引用，结果被丢弃 |
+| 动作类型 | 支持层级 | 守卫条件 | 跨层级影响 | 语义 |
+|---------|---------|---------|-----------|------|
+| `read` | User、Category、Feed | `!$entry->isRead()` | ✅ 有影响 | 先执行的层级如果标记为已读，后续层级的 `read` 动作会被守卫跳过。**先到先得** |
+| `star` | 仅 User | `!$entry->isUpdated()` | ❌ 无影响 | `isUpdated()` 检查的是"条目是否已在数据库中存在并被更新过"，与自动规则执行无关。只有 User 层级可配置此动作 |
+| `label` | 此链路不支持 | — | — | User/Category/Feed 均不可配置 label 动作，且此链路未传 `&$applyLabel` 引用。label 走链路 B |
 
-> **关键澄清**：`isUpdated()` ≠ `isFavorite()` 或 `isRead()`。`_isRead()` 和 `_isFavorite()` 只修改各自属性，**不会**修改 `is_updated` 标志。因此 `star` 和 `label` 的守卫是保护"已更新的旧条目"不被自动规则影响，而非防止多个层级重复执行。
+> **关键澄清**：`isUpdated()` ≠ `isFavorite()` 或 `isRead()`。`_isRead()` 和 `_isFavorite()` 只修改各自属性，**不会**修改 `is_updated` 标志。因此 `star` 的守卫是保护"已更新的旧条目"不被自动规则影响，而非防止多个层级重复执行。
 
-#### 执行顺序的实际效果示例
+#### 执行顺序的实际效果示例（修正后）
 
-假设：
-- 全局规则：`intitle:php` → `read`
-- 分类规则：`intext:framework` → `star`
-- Feed规则：`author:zend` → `read`
+假设（符合各层级实际支持的动作）：
+- 全局规则 User：`intitle:php` → `read`，`author:core` → `star`
+- 分类规则 Category：`intext:framework` → `read`
+- Feed规则 Feed：`#release` → `read`
 
-如果新条目同时匹配所有三个条件：
-1. 全局规则先执行 → 标记为已读，触发 `EntryAutoRead` hook
-2. 分类规则执行 → `isRead()` 已为 `true`，`read` 被跳过；但 `star` 守卫检查 `isUpdated()`，新条目为 `false`，所以标记为收藏
-3. Feed规则执行 → `read` 被守卫跳过（已读）
+如果新条目同时匹配所有四个条件：
+1. 全局规则先执行
+   - 匹配 `intitle:php` → 标记为已读，触发 `EntryAutoRead` hook
+   - 匹配 `author:core` → `isUpdated()` 为 `false`（新条目），标记为收藏
+2. 分类规则执行
+   - 匹配 `intext:framework` → `isRead()` 已为 `true`，`read` 被守卫跳过
+3. Feed规则执行
+   - 匹配 `#release` → `read` 被守卫跳过（已读）
 
 **最终效果**：已读 + 已收藏，**两个层级的不同动作累加生效**，而非覆盖。
 
 **安全约束**：`isUpdated()` 检查确保已更新的文章不会被自动标记为收藏或打标签，防止覆盖用户手动操作。
 
-#### 9.3.2 新条目提交后——自动打标签
+#### 9.3.2 链路 B：Tag 独立打标签链路（处理 label）
 
 [feedController.php#L879-L901](file:///d:/fz/0601-1/solo-dogfeeding/code/24-FreshRSS/app/Controllers/feedController.php#L879-L901)
 
-标签动作的处理与其他动作不同——它不能在入库时立即执行（因为标签关联需要条目已持久化），所以延迟到 `commitNewEntries` 之后：
+Tag 的 `label` 动作是完全独立的第二条链路——它不在 `Entry::applyFilterActions()` 中执行，而是延迟到条目提交到主表之后，由 `applyLabelActions()` 单独处理。原因是标签关联需要条目 ID 已持久化。
 
 ```
 actualizeFeedsAndCommit()
     │
-    ├─► actualizeFeeds()       ← 获取新条目，触发 applyFilterActions（read/star）
+    ├─► actualizeFeeds()       ← 链路 A：Entry::applyFilterActions（read/star）
     │
     └─► commitNewEntries()     ← 将临时表数据提交到主表
               │
-              └─► applyLabelActions()   ← 批量处理标签动作
+              └─► applyLabelActions()   ← 链路 B：Tag 独立打标签链路
                       │
-                      ├─► 查询所有配置了 label 动作的 Tag
-                      ├─► 遍历最近入库的条目
-                      ├─► 对每个 Tag 调用 Tag.applyFilterActions(entry)
+                      ├─► 从 FreshRSS_Context::labels() 获取所有 Tag
+                      ├─► 过滤出配置了 label 动作的 Tag（filtersAction('label') 非空）
+                      ├─► 查询最近入库的 N 条新条目（selectAll LIMIT nbNewEntries）
+                      │
+                      ├─► 嵌套循环：
+                      │     外层：遍历每条新 entry
+                      │     内层：遍历每个符合条件的 Tag
+                      │        └─► Tag.applyFilterActions(entry, &$applyLabel)
+                      │           ⚠️ 此处传递了 &$applyLabel 引用（链路 A 未传）
+                      │           若匹配 → $applyLabel = true
+                      │           收集 (id_tag, id_entry) 对
+                      │
                       └─► 批量执行 tagDAO.tagEntries($applyLabels)
+                           一次性 INSERT 所有标签关联
 ```
+
+**链路 B 与链路 A 的关键差异**：
+
+| 维度 | 链路 A（User/Category/Feed） | 链路 B（Tag） |
+|------|----------------------------|--------------|
+| 触发时机 | 条目入库前（内存中） | 条目提交到主表后 |
+| 执行入口 | `Entry::applyFilterActions()` | `feedController::applyLabelActions()` |
+| 处理动作 | `read`、`star` | 仅 `label` |
+| 调用方式 | 三层顺序调用，无引用参数 | 遍历所有 Tag，传 `&$applyLabel` 引用 |
+| 匹配引擎 | `Entry::matches()` 内存匹配 | 同左（复用同一引擎） |
+| 结果持久化 | Entry 属性变更随 INSERT 持久化 | 单独批量 INSERT 到 tag-entry 关联表 |
+
+**链路 B 的核心代码**：
 
 ```php
 private static function applyLabelActions(int $nbNewEntries): int|false {
     $tagDAO = FreshRSS_Factory::createTagDao();
+    // 过滤出配置了 label 动作的 Tag
     $labels = FreshRSS_Context::labels();
     $labels = array_filter($labels, static fn(FreshRSS_Tag $label) =>
         !empty($label->filtersAction('label')));
@@ -1259,17 +1294,22 @@ private static function applyLabelActions(int $nbNewEntries): int|false {
 
     $entryDAO = FreshRSS_Factory::createEntryDao();
     $applyLabels = [];
+    // 遍历最近入库的新条目
     foreach (FreshRSS_Entry::fromTraversable($entryDAO->selectAll(order: 'DESC', limit: $nbNewEntries)) as $entry) {
         foreach ($labels as $label) {
+            // ⚠️ 关键：传递了 &$applyLabel 引用，链路 A 未传此参数
             $label->applyFilterActions($entry, $applyLabel);
             if ($applyLabel) {
                 $applyLabels[] = ['id_tag' => $label->id(), 'id_entry' => $entry->id()];
             }
         }
     }
+    // 批量写入标签关联表
     return $tagDAO->tagEntries($applyLabels);
 }
 ```
+
+> **重要**：Tag 对象在链路 B 中虽然也调用 `FilterActionsTrait::applyFilterActions()`，但通过 UI 限制（[tag/update.phtml](file:///d:/fz/0601-1/solo-dogfeeding/code/24-FreshRSS/app/views/helpers/tag/update.phtml#L44-L51) + [tagController.php#L121](file:///d:/fz/0601-1/solo-dogfeeding/code/24-FreshRSS/app/Controllers/tagController.php#L121)），Tag 只能配置 `label` 动作，不能配置 `read` 或 `star`。因此链路 B 中即使遍历所有 Tag，也不会触发 `read`/`star` 动作。
 
 ### 9.4 过滤动作与搜索结果的协作边界
 
