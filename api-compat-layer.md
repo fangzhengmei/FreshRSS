@@ -182,13 +182,49 @@ switch ($_REQUEST['as']) {
   - `f=opml` → 订阅（读）→ `index/opml.phtml`（且需要 `query->safeForOpml()`）
 - 所有格式最终都走 `FreshRSS_index_Controller::listEntriesByContext()` 获取条目迭代器
 
-### 2.5 WebSub (pshb.php)：无用户鉴权的推送入口
+### 2.5 WebSub (pshb.php)：完全绕过 L1 api_enabled，由独立的 pubsubhubbub_enabled 开关控制 + 无用户鉴权的推送入口
 
 **入口**：[pshb.php](file:///d:/fz/0601-1/solo-dogfeeding/code/27-FreshRSS/p/api/pshb.php)
 
-- 认证：Feed Key（`k` 参数）+ `hub.json` 内容交叉校验，不涉及用户账户
-- 写操作：`FreshRSS_feed_Controller::actualizeFeedsAndCommit(feed_url: $topic, simplePiePush: $simplePiePush)` — 对订阅该 Feed 的所有用户逐一 actualize
-- 特殊：`Minz_Request::_param('auth_type', 'none')` 强制禁用登录要求
+#### 架构原因：两套独立的系统开关
+
+系统配置中存在两个完全独立的开关（[config.default.php](file:///d:/fz/0601-1/solo-dogfeeding/code/27-FreshRSS/config.default.php)）：
+
+| 配置项 | 行号 | 用途 | 控制范围 |
+|---|---|---|---|
+| `api_enabled` | [L79](file:///d:/fz/0601-1/solo-dogfeeding/code/27-FreshRSS/config.default.php#L79) | 用户 API（移动客户端 API） | GReader、Fever、Query、Misc 入口 |
+| `pubsubhubbub_enabled` | [L95](file:///d:/fz/0601-1/solo-dogfeeding/code/27-FreshRSS/config.default.php#L95) | WebSub 推送服务 | 订阅/取消订阅 WebSub 的请求是否发出（发送端） |
+
+**为什么 WebSub 不检查 `api_enabled`**：
+1. **服务对象不同**：`api_enabled` 面向**用户**（人通过客户端访问），WebSub 面向**第三方 Hub 服务器**（机器到机器通信）
+2. **认证体系不同**：用户 API 走用户名/密码/Token 体系，WebSub 走 Feed Key + hub.json 交叉校验的密钥体系
+3. **部署生命周期不同**：用户 API 是按需开关，WebSub 一旦订阅成功就会持续收到推送，不能因为用户临时关闭 API 而拒收推送（否则会丢失更新）
+4. **代码职责分层**：`api_enabled` 是用户层面的开关，WebSub 是系统级推送基础设施
+
+#### pshb.php 无 `api_enabled` 检查的验证
+
+对 `p/api/` 目录全局 grep `api_enabled` 结果：
+- [greader.php L1110](file:///d:/fz/0601-1/solo-dogfeeding/code/27-FreshRSS/p/api/greader.php#L1110) ✅ 有检查
+- [fever.php L24](file:///d:/fz/0601-1/solo-dogfeeding/code/27-FreshRSS/p/api/fever.php#L24) ✅ 有检查
+- [query.php L35](file:///d:/fz/0601-1/solo-dogfeeding/code/27-FreshRSS/p/api/query.php#L35) ✅ 有检查
+- [misc.php L48](file:///d:/fz/0601-1/solo-dogfeeding/code/27-FreshRSS/p/api/misc.php#L48) ✅ 有检查
+- [pshb.php](file:///d:/fz/0601-1/solo-dogfeeding/code/27-FreshRSS/p/api/pshb.php) **0 处检查** ❌ → 完全绕过 L1 系统开关
+
+#### pshb.php 也不检查 `pubsubhubbub_enabled`
+
+重要补充：`pubsubhubbub_enabled` 仅控制**发送端**（[Feed.php L1440-L1520](file:///d:/fz/0601-1/solo-dogfeeding/code/27-FreshRSS/app/Models/Feed.php#L1440-L1520) `pubSubHubbubSubscribe()` 是否发起订阅/取消订阅请求），不控制**接收端**（pshb.php 是否接收 Hub 推送）。pshb.php 从头到尾也没有检查 `pubsubhubbub_enabled`。原因：一旦已订阅成功（当初是开启状态时订阅的），Hub 就会持续推送，接收端不能因为管理员后来关闭了开关而拒收（拒收会导致 Hub 视为失败并最终取消订阅，数据丢失）。
+
+#### WebSub 认证方式：三步验证链
+
+- **L1 系统开关**：完全不检查，独立于用户 API 体系
+- **认证方式**：Feed Key（`k` 参数，128 字符十六进制）+ `!hub.json` 内容交叉校验。三步验证链：
+  1. `keys/{key}.txt` 存在且能读出 canonical URL（[pshb.php L28-L31](file:///d:/fz/0601-1/solo-dogfeeding/code/27-FreshRSS/p/api/pshb.php#L28-L31)）
+  2. `feeds/{sha1(canonical)}/!hub.json` 存在（[pshb.php L43-L49](file:///d:/fz/0601-1/solo-dogfeeding/code/27-FreshRSS/p/api/pshb.php#L43-L49)）
+  3. `hubJson['key'] === $key` 交叉校验（[pshb.php L51-L55](file:///d:/fz/0601-1/solo-dogfeeding/code/27-FreshRSS/p/api/pshb.php#L51-L55)）
+- **用户级检查**：actualize 前会检查每个用户的 `userConf()->enabled`（[pshb.php L151-L154](file:///d:/fz/0601-1/solo-dogfeeding/code/27-FreshRSS/p/api/pshb.php#L151-L154)），但不校验用户 API 凭证。
+- **写操作**：`FreshRSS_feed_Controller::actualizeFeedsAndCommit(feed_url: $canonical, simplePiePush: $simplePie, selfUrl: $self)` — 对订阅该 Feed 的所有用户逐一 actualize
+- **强制禁用登录**：[pshb.php L19](file:///d:/fz/0601-1/solo-dogfeeding/code/27-FreshRSS/p/api/pshb.php#L19) `FreshRSS_Context::systemConf()->auth_type = 'none'`
+- **协议分支**：`hub_mode=subscribe`（返回 hub_challenge 更新 lease_end）、`hub_mode=unsubscribe`（带 lease_end 检查）、默认 push 分发
 
 ### 2.6 Misc API (misc.php)：扩展级鉴权
 
@@ -424,6 +460,29 @@ return touch(USERS_PATH . '/' . $username . '/config.php');
 | 凭证 | 算法 | 存储位置 | 用途 |
 |---|---|---|---|
 | `apiPasswordHash` | `FreshRSS_password_Util::hash()`（bcrypt 系） | 用户配置 `data/users/{name}/config.php` | GReader Authorization Header 和 ClientLogin |
-| `feverKey` | `md5(strtolower($username) . ':' . $api_password)` | 用户配置 + 文件 `data/fever/.key-{sha1(salt)}-{feverKey}.txt`（纯文本用户名） | Fever `api_key` 参数 |
+| `feverKey` | `strtolower(md5("{$username}:{$passwordPlain}"))` — **username 保持原始大小写，md5 结果后才转 strtolower** | 用户配置 + 文件 `data/fever/.key-{sha1(system_salt)}-{feverKey}.txt`（文件内容为纯文本用户名） | Fever `api_key` 参数 |
+
+### Fever key 文件命名详解（[feverUtil.php L31-L34](file:///d:/fz/0601-1/solo-dogfeeding/code/27-FreshRSS/app/Utils/feverUtil.php#L31-L34)）
+
+```
+文件路径 = DATA_PATH/fever/.key-{sha1(systemConf()->salt)}-{feverKey}.txt
+```
+
+- 第一部分：`systemConf()->salt` 先做 `sha1()`，不是裸 salt 直接拼接
+- 第二部分：`feverKey` 本身就是 32 字符 md5 hex（lowercase）
+- 文件内容：纯文本用户名（`file_put_contents($feverKeyPath, $username)`，[feverUtil.php L50](file:///d:/fz/0601-1/solo-dogfeeding/code/27-FreshRSS/app/Utils/feverUtil.php#L50)）
+
+### Fever authenticate() 校验链（[fever.php L169-L194](file:///d:/fz/0601-1/solo-dogfeeding/code/27-FreshRSS/p/api/fever.php#L169-L194)）
+
+```
+$_POST['api_key']
+   → substr 0,128 → ctype_xdigit → strtolower（L172-L174）
+   → 读取文件 DATA_PATH/fever/.key-{sha1(salt)}-{feverKey}.txt 得到 username（L175）
+   → FreshRSS_Context::initUser(username)
+   → feverKey === userConf()->feverKey && userConf()->enabled（L179）
+   → 通过
+```
+
+**旧 key 清理机制**：每次 `updateKey()` 时先调 `deleteKey($username)`（[feverUtil.php L46](file:///d:/fz/0601-1/solo-dogfeeding/code/27-FreshRSS/app/Utils/feverUtil.php#L46)），从用户配置读出旧 `feverKey` 并 unlink 对应文件，确保同一用户旧密码立即失效。
 
 API 密码与 Web 登录密码 (`passwordHash`) 完全独立，互不影响。
