@@ -2,7 +2,9 @@
 
 ## 一、触发入口矩阵
 
-FreshRSS 通过以下 6 种独立入口触发 Feed 刷新：
+FreshRSS 通过以下 **8 种独立入口** 触发 Feed 刷新 / 条目入库：
+
+---
 
 ### 1.1 Web UI 手动刷新
 **控制器**: [feedController.php](file:///d:/fz/0601-1/solo-dogfeeding/code/21-FreshRSS/app/Controllers/feedController.php) 的 `actualizeAction()` (L954-L1033)
@@ -19,6 +21,8 @@ FreshRSS 通过以下 6 种独立入口触发 Feed 刷新：
 
 权限：登录用户；若 `allow_anonymous_refresh` 开启，则允许匿名访问 `actualize` 动作。
 
+---
+
 ### 1.2 添加 Feed 时首次刷新
 **入口**: [feedController.php](file:///d:/fz/0601-1/solo-dogfeeding/code/21-FreshRSS/app/Controllers/feedController.php) 的 `addFeed()` 静态方法 (L39-L117)
 
@@ -27,6 +31,8 @@ FreshRSS 通过以下 6 种独立入口触发 Feed 刷新：
 self::actualizeFeedsAndCommit($id, $url);
 ```
 是 **同步阻塞** 的，会等待新 Feed 的第一批条目入库完成后才返回给用户。
+
+---
 
 ### 1.3 系统级 CLI 全量刷新 (Cron)
 **脚本**: [actualize_script.php](file:///d:/fz/0601-1/solo-dogfeeding/code/21-FreshRSS/app/actualize_script.php)
@@ -43,6 +49,8 @@ php app/actualize_script.php
 - `FeedBeforeActualize` hook 中每次 `touch($mutexFile)` 续期锁
 - 每个用户独立初始化上下文、扩展、翻译
 
+---
+
 ### 1.4 单用户 CLI 刷新
 **脚本**: [actualize-user.php](file:///d:/fz/0601-1/solo-dogfeeding/code/21-FreshRSS/cli/actualize-user.php)
 
@@ -58,6 +66,8 @@ php app/actualize_script.php
 4. `actualizeFeedsAndCommit()` 直接调用核心函数
 5. 不使用全局互斥锁，由调用方自行排程
 
+---
+
 ### 1.5 WebSub (PubSubHubbub) 实时推送
 **入口**: [pshb.php](file:///d:/fz/0601-1/solo-dogfeeding/code/21-FreshRSS/p/api/pshb.php)
 
@@ -71,10 +81,106 @@ actualizeFeedsAndCommit(feed_url: $canonical, simplePiePush: $simplePie, selfUrl
 ```
 传入已解析好的 `SimplePieCustom` 对象，**跳过 HTTP 拉取**，直接走去重/入库链路。
 
+---
+
 ### 1.6 JavaScript 后台自动刷新
 **入口**: `actualize.phtml` 视图 + `javascriptController`
 
 由浏览器前端 JS 定时轮询，参数组合与 1.1 的 AJAX 模式相同。
+
+---
+
+### 1.7 导入订阅时批量入库
+**入口**: [importExportController.php](file:///d:/fz/0601-1/solo-dogfeeding/code/21-FreshRSS/app/Controllers/importExportController.php) + CLI [import-for-user.php](file:///d:/fz/0601-1/solo-dogfeeding/code/21-FreshRSS/cli/import-for-user.php)
+
+支持两种调用方式：
+- **Web**: `?c=importExport&a=import` (POST 上传文件)
+- **CLI**: `./cli/import-for-user.php --user xxx --filename xxx.zip`
+
+支持的文件格式：
+
+| 格式 | 说明 |
+|------|------|
+| OPML (`.opml` / `.xml`) | 只导入 Feed 列表（分类 + URL），不导入条目 |
+| JSON starred | Google Reader 格式的收藏/标注条目 |
+| JSON feed | 包含完整文章内容的 JSON 文件 |
+| TXT | 纯文本每行一个 URL，内部转成 OPML 再导入 |
+| TT-RSS XML | TinyTiny RSS 导出的 starred 条目，内部转 JSON 再导入 |
+| ZIP | 以上格式打包，按文件名自动识别类型 |
+
+导入顺序 (L111-L113)：**OPML 先** → 收藏/标签中 → 其他文章最后，确保 feed 存在后再导入条目。
+
+#### JSON 条目导入的核心链路
+[importExportController.php](file:///d:/fz/0601-1/solo-dogfeeding/code/21-FreshRSS/app/Controllers/importExportController.php) L331-L592 `importJson()`:
+
+```
+① 遍历 items，按 origin.feedUrl 查找/创建 Feed
+② 按 feed 分组收集所有 guid
+③ 批量 listHashForFeedGuids() 查已存在条目
+④ beginTransaction  ← 第一事务开始
+⑤ 逐条 Entry 判定：
+   • 新 GUID → addEntry(tmp=true) 写 _entrytmp
+   • 已存在 → updateEntry() 直接更 _entry
+⑥ commit  ← 第一事务边界（条目落库）
+
+⑦ beginTransaction  ← 第二事务开始
+⑧ commitNewEntries()  ← tmp → 主表迁移
+⑨ updateCachedValues()
+⑩ commit  ← 第二事务边界
+
+⑪ beginTransaction  ← 第三事务开始
+⑫ 为每条新条目查 ID → tagEntry() 打标签
+⑬ commit  ← 第三事务边界（标签关联）
+```
+
+**与常规刷新的关键区别**：
+- 不经过 `actualizeFeeds()` 和 `decideEntryGuid()`，**直接使用源文件中的 guid/id**
+- 不执行全文抓取、lastSeen 刷新、归档清理等后处理
+- 事务粒度更细（3 段式事务），避免大事务锁定过长
+- `is_read`/`is_favorite` 状态从导入文件中读取，不应用自动标记规则
+
+---
+
+### 1.8 重新抓取 (Reload Articles)
+**入口**: [feedController.php](file:///d:/fz/0601-1/solo-dogfeeding/code/21-FreshRSS/app/Controllers/feedController.php) 的 `reloadAction()` (L1208-L1264)
+
+路由：`?c=feed&a=reload` (POST)，参数：
+- `id`: Feed ID (必填)
+- `reload_limit`: 重新抓取的文章数量，默认 10
+
+分为 **两个独立阶段**：
+
+**阶段一：强制刷新 Feed**
+```php
+$feedDAO->updateFeed($feed->id(), ['lastUpdate' => 0]);  // 归零，绕过 TTL
+self::actualizeFeedsAndCommit($feed_id);                  // 走完整刷新链路
+```
+把 `lastUpdate` 设为 0，强制绕过 TTL 检查，等同于把 Feed 当成新订阅重新拉一次。
+
+**阶段二：全文内容重抓**
+```php
+$entries = $entryDAO->listWhere('f', $feed_id, STATE_ALL, order: 'DESC', limit: $limit);
+foreach ($entries as $entry) {
+    if ($entry->loadCompleteContent(true)) {    // force=true 强制重抓
+        $entry->_lastModified(time());
+        if (内容有变化) {
+            $entryDAO2->updateEntry($entry->toArray());
+        }
+    }
+}
+```
+
+**隐式自动重抓**（在常规刷新中）：
+在 [feedController.php](file:///d:/fz/0601-1/solo-dogfeeding/code/21-FreshRSS/app/Controllers/feedController.php) L681-L682，当检测到条目内容变化 (hash 不同) 时，会自动触发：
+```php
+// If the entry has changed, there is a good chance for the full content to have changed as well.
+$entry->loadCompleteContent(true);
+```
+
+**技术细节**：
+- **MySQL**：用第二个独立 PDO 连接（关闭共享 PDO）做非缓冲查询流式处理
+- **SQLite / PostgreSQL**：单连接内存缓冲查询
+- 只更新 `content` 字段，**不会触发 hash 变化**（因为 hash 用的是 `originalContent()`，FULLCONTENT 追加段不计入）
 
 ---
 
@@ -173,17 +279,51 @@ null / id ──┐
 **代码位置**: [Entry.php](file:///d:/fz/0601-1/solo-dogfeeding/code/21-FreshRSS/app/Models/Entry.php) 的 `hash()` (L513-L520)
 
 ```php
-md5(
-    $this->link
-  . $this->title
-  . $this->authors(true)      // 用 ; 拼接的作者字符串
-  . $this->originalContent()   // 不含 FULLCONTENT 附加段
-  . $this->tags(true)          // #tag1 #tag2 格式
-  . json_encode(enclosures)    // 附件元数据
-)
+public function hash(): string {
+    if ($this->hash === '') {
+        $attributes = empty($this->attributeArray('enclosures'))
+            ? ''
+            : json_encode($this->attributes(), JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+        //Do not include $this->date because it may be automatically generated when lacking
+        $this->hash = md5(
+            $this->link
+          . $this->title
+          . $this->authors(true)
+          . $this->originalContent()
+          . $this->tags(true)
+          . $attributes
+        );
+    }
+    return $this->hash;
+}
 ```
 
-> **故意不含 `date` 字段**，因为 RSS 源常缺发布时间，FreshRSS 会用 `time()` 自动填充，会造成"内容没变但 hash 变了"的假更新。
+#### 各字段的准确含义（修正版）：
+
+| 组成部分 | 方法 / 表达式 | 实际格式 | 说明 |
+|---------|------|---------|------|
+| `link` | `$this->link` | 原始字符串 | trim 后的链接 |
+| `title` | `$this->title` | 原始字符串 | trim 后的标题 |
+| `authors` | `$this->authors(true)` | `;作者1; 作者2` | 分号分隔，**以分号开头**；空数组返回空串 |
+| `content` | `$this->originalContent()` | 原始 HTML | **不含 FULLCONTENT 扩展追加的全文** |
+| `tags` | `$this->tags(true)` | `#tag1 #tag2` | 空格分隔，每个 tag 前缀 `#`；空数组返回空串 |
+| `attributes` | 条件表达式 | JSON 串 或 空串 | **不是只有 enclosures**：enclosures 为空则传空串 `""`；否则传 **整个 attributes 数组** 的 JSON |
+
+#### `originalContent()` 的完整逻辑 ([Entry.php](file:///d:/fz/0601-1/solo-dogfeeding/code/21-FreshRSS/app/Models/Entry.php) L210-L213)：
+```php
+public function originalContent(): string {
+    return $this->attributeString('original_content') ??
+        preg_replace('#<!-- FULLCONTENT start //-->.*<!-- FULLCONTENT end //-->#s', '', $this->content) ?? '';
+}
+```
+优先级：
+1. 优先使用 `original_content` 属性（CSS/XPath 全文抓取时备份的原始 RSS 摘要）
+2. 否则用正则剥离 `<!-- FULLCONTENT start //-->...<!-- FULLCONTENT end //-->` 段
+3. 结果为 `null` 则返回空串
+
+> **故意不含 `date` 字段**：因为 RSS 源常缺发布时间，FreshRSS 会用 `time()` 自动填充，会造成"内容没变但 hash 变了"的假更新。
+
+> **FULLCONTENT 排除的意义**：`hash()` 使用 `originalContent()` 而不是 `content()`，因此通过 CSS/XPath 全文抓取扩展追加的内容**不会**改变 hash，避免每次全文重抓都触发假更新。
 
 在 [feedController.php](file:///d:/fz/0601-1/solo-dogfeeding/code/21-FreshRSS/app/Controllers/feedController.php) L631-L691 完成双层判定：
 
@@ -195,6 +335,7 @@ foreach ($entries as $entry) {
         // GUID 已存在 -> 比较 hash
         if (strcasecmp($existingHash, $entry->hash()) !== 0) {
             // 内容有变化 → updateEntry()
+            // 注：变化时会自动调用 loadCompleteContent(true) 重抓全文
         } else {
             // 完全相同 → 跳过，只更新 lastSeen
         }
@@ -247,6 +388,7 @@ foreach ($entries as $entry) {
 **方法**: [EntryDAO.php](file:///d:/fz/0601-1/solo-dogfeeding/code/21-FreshRSS/app/Models/EntryDAO.php) 的 `addEntry()` (L192-L263)
 
 ```php
+// SQL 模板（由各数据库的 sqlIgnoreConflict/isCompressed/sqlHexDecode 注入差异）
 INSERT IGNORE INTO `_entrytmp` (
     id, guid, title, author, content_bin, link, date, lastSeen,
     hash, is_read, is_favorite, id_feed, tags, attributes
@@ -359,7 +501,137 @@ WHERE id_feed=:id_feed AND guid=:guid
 
 ---
 
-## 五、扩展 Hook 插入点
+## 五、多数据库落库差异
+
+FreshRSS 支持 MySQL/MariaDB、SQLite、PostgreSQL 三种数据库后端，通过 DAO 继承链实现差异：
+
+```
+EntryDAO (基类，MySQL 实现)
+    ├── EntryDAOSQLite      // SQLite 覆盖
+    └── EntryDAOPGSQL       // PostgreSQL 覆盖（继承 SQLite）
+```
+
+核心差异通过以下模板方法注入：
+- `sqlIgnoreConflict(string $sql)` - 改写 INSERT 语句的冲突处理
+- `isCompressed()` - 是否使用 COMPRESS 压缩内容
+- `hasNativeHex()` - 是否支持 SQL 原生 hex 解码
+- `sqlHexDecode(string $x)` - hash 字段的解码函数
+- `commitNewEntries()` - 临时表→主表迁移算法（三数据库完全不同）
+
+### 5.1 核心差异总表
+
+| 特性 | MySQL / MariaDB<br>([EntryDAO.php](file:///d:/fz/0601-1/solo-dogfeeding/code/21-FreshRSS/app/Models/EntryDAO.php)) | SQLite<br>([EntryDAOSQLite.php](file:///d:/fz/0601-1/solo-dogfeeding/code/21-FreshRSS/app/Models/EntryDAOSQLite.php)) | PostgreSQL<br>([EntryDAOPGSQL.php](file:///d:/fz/0601-1/solo-dogfeeding/code/21-FreshRSS/app/Models/EntryDAOPGSQL.php)) |
+|------|---------|--------|------------|
+| **内容压缩** | `COMPRESS(:content)` → `content_bin` | 不压缩 → `content` TEXT | 不压缩 → `content` TEXT |
+| **isCompressed()** | `true` | `false` | `false` (继承 SQLite) |
+| **Hash 解码** | `UNHEX(:hash)` (SQL 原生) | PHP `hex2bin()` 后绑定 | `decode(:hash, 'hex')` (SQL 原生) |
+| **hasNativeHex()** | `true` | `false` | `true` |
+| **冲突忽略语法** | `INSERT IGNORE INTO` | `INSERT OR IGNORE INTO` | `... ON CONFLICT DO NOTHING` |
+| **commitNewEntries 算法** | 用户变量 `@rank` | 临时表 + `rowid` | PL/pgSQL `DO $$` 块 + `row_number() OVER()` |
+| **随机函数** | `RAND()` | `RANDOM()` | `RANDOM()` |
+| **字符串拼接** | `CONCAT(s1, s2)` | `s1 \|\| s2` | 继承 SQLite |
+| **正则匹配** | `REGEXP ?` | `REGEXP ?` + PHP 回调注册 | `~ ?` / `~* ?` + `\b→\y` 转义 |
+| **LIMIT ALL** | 省略或 `LIMIT 18446744073709551615` | `LIMIT -1` | `LIMIT ALL` |
+| **autoUpdateDb 检测** | SQLSTATE 42S22 查错信息 | `PRAGMA table_info('entry')` | 错误码 `UNDEFINED_COLUMN` + 文本匹配 |
+
+### 5.2 addEntry 具体差异
+
+**MySQL** (基类默认实现)：
+```php
+// sqlIgnoreConflict 替换: INSERT INTO → INSERT IGNORE INTO
+// isCompressed()=true: 列名用 content_bin，值用 COMPRESS(:content)
+// sqlHexDecode(':hash') = UNHEX(:hash)
+// hasNativeHex()=true: hash 直接绑定 hex 字符串
+INSERT IGNORE INTO `_entrytmp` (id, guid, ..., content_bin, ..., hash, ...)
+VALUES (:id, :guid, ..., COMPRESS(:content), ..., UNHEX(:hash), ...);
+```
+
+**SQLite** (调用 `sqlIgnoreConflict` + PHP 侧 hex2bin)：
+```php
+// sqlIgnoreConflict 替换: INSERT INTO → INSERT OR IGNORE INTO
+// isCompressed()=false: 列名用 content，值用 :content
+// sqlHexDecode(':hash') = ':hash' (原样输出)
+// hasNativeHex()=false: hash 先经 PHP hex2bin() 转二进制再绑定
+INSERT OR IGNORE INTO `_entrytmp` (id, guid, ..., content, ..., hash, ...)
+VALUES (:id, :guid, ..., :content, ..., :hash_bin, ...);
+```
+
+**PostgreSQL** (继承 SQLite 的内容列，但用原生 decode)：
+```php
+// sqlIgnoreConflict 追加: ... ON CONFLICT DO NOTHING
+// isCompressed()=false (继承 SQLite): 列名用 content
+// sqlHexDecode(':hash') = decode(:hash, 'hex')
+// hasNativeHex()=true: hash 直接绑定 hex 字符串
+INSERT INTO `_entrytmp` (...) VALUES (...) ON CONFLICT DO NOTHING;
+```
+
+### 5.3 commitNewEntries 具体差异
+
+**MySQL**（用户变量法，单 SQL 事务）：
+```sql
+SET @rank = (SELECT MAX(id) - COUNT(*) FROM `_entrytmp`);
+INSERT IGNORE INTO `_entry` (...)
+    SELECT @rank := @rank + 1 AS id, ... FROM `_entrytmp` ORDER BY date, id;
+DELETE FROM `_entrytmp` WHERE id <= @rank;
+```
+- 利用 MySQL 用户变量 `@rank` 自增生成连续 ID
+- 依赖外部事务保证原子性；若外部无事务则方法内部自动开启/提交
+
+**SQLite**（临时表 + rowid 法，4 条 SQL）：
+```sql
+DROP TABLE IF EXISTS `tmp`;
+CREATE TEMP TABLE `tmp` AS SELECT ... FROM `_entrytmp` ORDER BY date, id;
+INSERT OR IGNORE INTO `_entry`
+    SELECT rowid + (SELECT MAX(id) - COUNT(*) FROM `tmp`) AS id, ...
+    FROM `tmp` ORDER BY date, id;
+DELETE FROM `_entrytmp` WHERE id <= (SELECT MAX(id) FROM `tmp`);
+DROP TABLE IF EXISTS `tmp`;
+```
+- 用临时表缓存排序结果，利用 SQLite 内置 `rowid` 生成连续 ID
+- 方法内部自带事务保护（检测外部无事务则开启）
+
+**PostgreSQL**（PL/pgSQL + 窗口函数法，匿名块）：
+```sql
+DO $$
+DECLARE
+    maxrank bigint := (SELECT MAX(id) FROM `_entrytmp`);
+    rank bigint := (SELECT maxrank - COUNT(*) FROM `_entrytmp`);
+BEGIN
+    INSERT INTO `_entry` (...)
+    (SELECT rank + row_number() OVER(ORDER BY etmp.date, etmp.id) AS id, ...
+     FROM `_entrytmp` AS etmp
+     WHERE NOT EXISTS (
+         SELECT 1 FROM `_entry` AS ereal
+         WHERE (etmp.id = ereal.id)
+            OR (etmp.id_feed = ereal.id_feed AND etmp.guid = ereal.guid))
+     ORDER BY etmp.date, etmp.id);
+    DELETE FROM `_entrytmp` WHERE id <= maxrank;
+END $$;
+```
+- 用 `row_number() OVER()` 窗口函数生成连续 ID
+- **去重方式特殊**：用 `WHERE NOT EXISTS` 子查询双重判断 (id 冲突 + guid+feedId 冲突)，而不是 `ON CONFLICT DO NOTHING`（代码注释 TODO：升级到 PG 9.5+ 语法）
+- PL/pgSQL 块本身就是原子的，不需要额外事务
+
+### 5.4 其他重要差异
+
+**`markRead` 实现**：
+- MySQL：批量 ID 一次 `UPDATE ... WHERE id IN (...)`，性能最优
+- SQLite：循环逐个 ID 更新（每个都有独立子事务 + 缓存更新），批量性能较差
+- PostgreSQL：继承 SQLite 实现
+
+**正则函数注册**：
+- MySQL：`REGEXP` 是内置的，无需额外操作
+- SQLite：执行前检测 `REGEXP` 关键字，用 `sqliteCreateFunction` 注册 PHP 回调实现正则匹配
+- PostgreSQL：无需注册，用 `~` (区分大小写) / `~*` (不区分) 操作符，且把 PCRE 语法 `\b` → `\y`、`\B` → `\Y` 做转义
+
+**autoUpdateDb 列缺失检测**：
+- MySQL：捕获 SQLSTATE `42S22` (ER_BAD_FIELD_ERROR)，解析错误信息中的列名
+- SQLite：每次出错都执行 `PRAGMA table_info('entry')` 检查表结构
+- PostgreSQL：捕获错误码 `UNDEFINED_COLUMN`，在错误信息第一行匹配列名
+
+---
+
+## 六、扩展 Hook 插入点
 
 在关键链路中可通过扩展接管或修改流程：
 
@@ -381,15 +653,16 @@ WHERE id_feed=:id_feed AND guid=:guid
 
 ---
 
-## 六、完整调用图总览
+## 七、完整调用图总览
 
 ```
-用户 / Cron / WebSub / JS
+用户 / Cron / WebSub / JS / 导入 / 重抓
     │
     ▼
 ┌──────────────────────────────────────────────────────────┐
 │ actualizeAction  │  actualize-user.php  │  pshb.php      │
-│ addFeed          │  actualize_script.php│                │
+│ addFeed          │  actualize_script.php│  importJson    │
+│ reloadAction     │                      │                │
 └────────────────────┬─────────────────────────────────────┘
                      ▼
         actualizeFeedsAndCommit()  ──────────────┐
@@ -406,6 +679,7 @@ WHERE id_feed=:id_feed AND guid=:guid
            │  6. 每条 Entry:                      │
            │     ├ 新 GUID ──▶ addEntry(_entrytmp)│
            │     └ 内容变 ──▶ updateEntry(_entry) │
+           │        (自动 loadCompleteContent)    │
            │  7. updateLastSeen                   │
            │  8. 概率 cleanOldEntries             │
            └───────────────────┬──────────────────┘
@@ -415,6 +689,7 @@ WHERE id_feed=:id_feed AND guid=:guid
               │ ① beginTransaction()          │
               │ ② commitNewEntries()          │
               │    └ _entrytmp ─▶ _entry      │
+              │    (MySQL/SQLite/PG 各不同)   │
               │ ③ applyLabelActions()         │
               │ ④ keepMaxUnreads()            │
               │ ⑤ updateCachedValues()        │
