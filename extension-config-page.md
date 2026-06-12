@@ -116,6 +116,106 @@ $list_thirdparty_extensions = array_diff(scandir(THIRDPARTY_EXTENSIONS_PATH) ?: 
 
 `extensions_enabled` 结构为 `array<string, bool>`，key 是扩展名，value 表示启用（`true`）/禁用（`false`）。
 
+对应默认配置：
+- 系统默认：[config.default.php#L228-L231](file:///d:/fz/0601-1/solo-dogfeeding/code/28-FreshRSS/config.default.php#L228-L231)
+- 用户默认：[config-user.default.php#L143-L148](file:///d:/fz/0601-1/solo-dogfeeding/code/28-FreshRSS/config-user.default.php#L143-L148)
+
+### 2.5 系统扩展与用户扩展分两阶段启用的深度分析
+
+在 [FreshRSS::init()](file:///d:/fz/0601-1/solo-dogfeeding/code/28-FreshRSS/app/FreshRSS.php#L21-L70) 中，系统扩展和用户扩展是分开两次启用的，中间穿插了若干关键初始化步骤。其代码顺序严格定义如下：
+
+```
+第 43 行:  Minz_ExtensionManager::init()          ← 阶段一：发现扩展 + 启用系统扩展
+第 47 行:  self::initAuth()                        ← 认证系统初始化（创建 $_SESSION['currentUser']）
+第 49 行:  FreshRSS_Context::initUser()            ← 用户配置加载
+第 58 行:  self::initI18n()                        ← 国际化（依赖用户配置 language）
+第 61-62 行: Minz_ExtensionManager::enableByList() ← 阶段二：启用用户扩展
+```
+
+#### 原因一：依赖的前置条件不同
+
+系统扩展和用户扩展所依赖的系统基础设施完全不同，必须在不同的启动阶段运行：
+
+| 扩展类型 | 可依赖的初始化步骤 | 不允许依赖 |
+|---|---|---|
+| **系统扩展** | `FreshRSS_Context::initSystem()`（系统配置已就绪） | 用户会话、用户配置、i18n、Auth |
+| **用户扩展** | 系统配置 + Auth + 用户配置 + i18n + 共享系统 | 无额外限制 |
+
+`ExtensionManager::init()` 在 [第 68-71 行](file:///d:/fz/0601-1/solo-dogfeeding/code/28-FreshRSS/lib/Minz/ExtensionManager.php#L68-L71) 读取系统配置中的 `extensions_enabled` 来启用系统扩展——此时用户配置甚至还不存在（因为 `initUser()` 还没执行）。
+
+而用户扩展的启用调用在 [第 61-62 行](file:///d:/fz/0601-1/solo-dogfeeding/code/28-FreshRSS/app/FreshRSS.php#L61-L62) 读取 `FreshRSS_Context::userConf()->extensions_enabled`，这显然要求用户上下文已经建立。
+
+#### 原因二：扩展 `init()` 的典型操作对时机有要求
+
+观察扩展 `init()` 可能执行的操作：
+
+```php
+// 在扩展 init() 中常见的调用
+$this->registerHook(Minz_HookType::EntryBeforeDisplay, ...);   // 无需用户上下文
+$this->registerTranslates();                                     // 无需用户上下文
+Minz_View::appendStyle(...)                                      // 无需用户上下文
+$this->getUserConfigurationValue(...)                            // 必须在用户配置就绪之后
+Minz_User::name()                                                // 必须在 Auth 就绪之后
+```
+
+系统扩展（如修改认证流程、自定义登录页的扩展）必须在认证系统之前介入。例如 `FreshrssInit` Hook 在 [第 69 行](file:///d:/fz/0601-1/solo-dogfeeding/code/28-FreshRSS/app/FreshRSS.php#L69) 被触发时，系统扩展和用户扩展都已可用——但系统扩展需要在更早时刻已经被注册才能影响中间的认证流程。
+
+#### 原因三：权限与隔离
+
+系统扩展由 admin 在系统配置中统一控制，对所有用户生效；用户扩展由每个用户独立控制。如果混合到一个阶段启用，就无法在运行时区分"系统层面强制启用"和"用户自行选择启用"的权限边界。
+
+在 `enable()` 私有方法中，`$onlyOfType` 参数（[第 181-190 行](file:///d:/fz/0601-1/solo-dogfeeding/code/28-FreshRSS/lib/Minz/ExtensionManager.php#L181-L190)）确保每次 `enableByList()` 只启用指定类型的扩展，避免用户配置意外启用系统扩展。
+
+#### 原因四：启动失败时的影响域可控
+
+若系统扩展启动失败（抛异常），因为此时用户上下文尚未建立，失败仅影响全局级别，不会污染任何用户会话；若用户扩展启动失败，其影响仅局限于单个用户的启用状态（见 2.6 节的隔离机制）。两个阶段之间的间隔使得故障定位清晰。
+
+#### 其他入口点的一致性
+
+在 Web API（[p/api/greader.php#L1123-L1124](file:///d:/fz/0601-1/solo-dogfeeding/code/28-FreshRSS/p/api/greader.php#L1123-L1124)、[p/api/pshb.php#L137-L155](file:///d:/fz/0601-1/solo-dogfeeding/code/28-FreshRSS/p/api/pshb.php#L137-L155)、[p/api/query.php#L63-L64](file:///d:/fz/0601-1/solo-dogfeeding/code/28-FreshRSS/p/api/query.php#L63-L64)）以及 CLI（[cli/_cli.php#L18-L43](file:///d:/fz/0601-1/solo-dogfeeding/code/28-FreshRSS/cli/_cli.php#L18-L43)）中，都严格遵循同样的两阶段模式：先 `ExtensionManager::init()`（系统扩展），在用户上下文就绪后再 `enableByList(userConf->extensions_enabled, 'user')`。这不是偶然，而是架构级约束。
+
+### 2.6 启用失败的影响隔离机制
+
+启用失败发生在 `ExtensionManager::enable()` 的 `$ext->init()` 调用处（[第 198-204 行](file:///d:/fz/0601-1/solo-dogfeeding/code/28-FreshRSS/lib/Minz/ExtensionManager.php#L198-L204)），其隔离措施是多层的：
+
+```php
+try {
+    $ext->init();
+} catch (Minz_Exception $e) {
+    Minz_Log::warning('Error while enabling extension ' . $ext->getName() . ': ' . $e->getMessage());
+    $ext->disable();                         // 1. 标记扩展为禁用
+    unset(self::$ext_list_enabled[$ext_name]); // 2. 从内存启用列表移除
+}
+```
+
+#### 隔离层一：内存态隔离
+
+异常被 catch 后，执行两个关键操作：
+1. `$ext->disable()`：将扩展对象内部的 `is_enabled` 标志重置为 `false`
+2. `unset(self::$ext_list_enabled[$ext_name])`：从静态启用列表中移除该扩展
+
+这保证后续调用 `listExtensions(true)` 和 `isExtensionEnabled()` 都看不到这个扩展。其他扩展的启用不受影响（`enableByList()` 使用 foreach 循环逐个启用，单个的异常被限制在那一次 `enable()` 调用内）。
+
+#### 隔离层二：持久化与内存态不一致（保护性设计）
+
+注意：**此处 catch 块不会修改持久化配置中的 `extensions_enabled`**。这是有意为之：
+
+- 如果扩展因为临时原因（依赖服务未就绪）而 init() 失败，下次请求可能成功。配置中仍然标记为"已启用"，意味着下次启动时会再次尝试启用。
+- 如果扩展永久损坏，用户（或管理员）仍然可以在扩展管理界面看到它（因为它在 `$ext_list` 中仍存在），并通过 `disableAction()` 显式地将配置中的状态改为 `false`，同时看到错误日志链接进行排查。
+
+这实现了"**启用失败不自动回滚配置**"的策略——把是否永久禁用的决定权交还给管理员，而不是静默地把扩展从配置中清除。
+
+#### 隔离层三：仅捕获 Minz_Exception
+
+catch 语句只捕获 `Minz_Exception`（而不是更宽泛的 `Exception` 或 `Throwable`）。这是一种契约：扩展开发者应使用 `Minz_ExtensionException`（继承自 `Minz_Exception`）抛出预期内的错误。原生 PHP Error（如语法错误、类型错误）将穿透到上层错误处理，从而暴露真正需要修复的代码缺陷，而不是被静默吞掉。
+
+#### 不同启动阶段的故障影响范围
+
+| 阶段 | 启用失败的影响范围 | 恢复手段 |
+|---|---|---|
+| 系统扩展阶段一 | 全局：该系统扩展对所有用户不可用，其他系统扩展不受影响 | 管理员修复扩展或在配置中关闭它 |
+| 用户扩展阶段二 | 仅该用户：该扩展对当前用户不可用，不影响其他用户 | 用户在扩展管理界面操作 |
+
 ---
 
 ## 三、配置表单（Configuration Page）
@@ -252,7 +352,7 @@ public function handleConfigureAction(): void {
 - **Slider 模式**（`slider=1`）：在扩展列表页右侧的 slider 面板中展示
 - **默认**：独立页面，带 `aside_configure` 侧边栏
 
-### 3.7 扩展列表页
+### 3.9 扩展列表页
 
 [indexAction()](file:///d:/fz/0601-1/solo-dogfeeding/code/28-FreshRSS/app/Controllers/extensionController.php#L25-L41) 展示：
 
