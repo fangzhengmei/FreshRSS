@@ -627,3 +627,347 @@ stream-footer 和 nav_menu 的"全部标已读"按钮提交表单后，`readActi
       → HookType::EntriesFavorite 扩展钩子（传整个 ids 数组）
   → 返回 OK
 ```
+
+---
+
+## 十、侧栏统计范围深度剖析：隐藏来源是否被包含？
+
+侧栏各个计数器的统计范围**并不统一**，取决于优先级阈值和数据来源。优先级常量定义于 [Feed.php L38-L44](file:///d:/fz/0601-1/solo-dogfeeding/code/23-FreshRSS/app/Models/Feed.php#L38-L44)：
+
+```php
+public const PRIORITY_IMPORTANT   = 20;
+public const PRIORITY_MAIN_STREAM = 10;
+public const PRIORITY_CATEGORY    = 0;
+public const PRIORITY_FEED        = -5;
+public const PRIORITY_HIDDEN      = -10;
+```
+
+### 10.1 收藏总数与未读数：排除隐藏来源
+
+**`countUnreadReadFavorites()`** — [EntryDAO.php L2019-L2034](file:///d:/fz/0601-1/solo-dogfeeding/code/23-FreshRSS/app/Models/EntryDAO.php#L2019-L2034)
+
+```sql
+SELECT
+    COUNT(*) AS total,
+    COUNT(CASE WHEN e.is_read = 0 THEN 1 END) AS unread
+FROM `_entry` e
+JOIN `_feed` f ON e.id_feed = f.id
+WHERE e.is_favorite = 1 AND f.priority > :priority
+```
+`:priority = PRIORITY_HIDDEN (-10)`，所以条件是 `f.priority > -10`。
+
+**结论**：隐藏来源（priority=-10）**不**包含在侧栏收藏统计中。只有 `priority > -10`（即 PRIORITY_FEED 及以上）的 feed 的收藏文章会被计入。
+
+这个结果在 [Context.php L243](file:///d:/fz/0601-1/solo-dogfeeding/code/23-FreshRSS/app/Models/Context.php#L243) 被赋值给 `FreshRSS_Context::$total_starred`，用于：
+- 侧栏"收藏夹"标题数字 `'favorites (123)'` — [aside_feed.phtml L61](file:///d:/fz/0601-1/solo-dogfeeding/code/23-FreshRSS/app/layout/aside_feed.phtml#L61)
+- 侧栏收藏夹的 `data-unread` 属性 — [aside_feed.phtml L58-L60](file:///d:/fz/0601-1/solo-dogfeeding/code/23-FreshRSS/app/layout/aside_feed.phtml#L58-L60)
+- 进入收藏视图时的 `$get_unread` — [Context.php L496](file:///d:/fz/0601-1/solo-dogfeeding/code/23-FreshRSS/app/Models/Context.php#L496)
+
+### 10.2 全局未读数：只统计主流来源
+
+**`FreshRSS_Category::countUnread()`** — [Category.php L339-L345](file:///d:/fz/0601-1/solo-dogfeeding/code/23-FreshRSS/app/Models/Category.php#L339-L345)
+
+```php
+self::$total_unread = FreshRSS_Category::countUnread(
+    self::categories(),
+    FreshRSS_Feed::PRIORITY_MAIN_STREAM  // minPriority = 10
+);
+```
+
+内部遍历每个 category，调用 `$category->nbNotRead($minPriority)` — [Category.php L95-L114](file:///d:/fz/0601-1/solo-dogfeeding/code/23-FreshRSS/app/Models/Category.php#L95-L114)：
+
+```php
+foreach ($this->feeds as $feed) {
+    if ($feed->priority() >= $minPriority) {  // >= 10
+        $nb += $feed->nbNotRead();
+    }
+}
+```
+
+**结论**：全局未读数只统计 `priority >= 10`（PRIORITY_MAIN_STREAM 及以上）的 feed，隐藏来源（-10）和分类级（0）、feed 级（-5）都不包含。
+
+同理，`self::$total_important_unread` 使用 `PRIORITY_IMPORTANT (20)`，只统计重要 feed。
+
+### 10.3 单个 Feed 未读数：不做优先级过滤
+
+**`Feed::nbNotRead()`** — [Feed.php L413-L420](file:///d:/fz/0601-1/solo-dogfeeding/code/23-FreshRSS/app/Models/Feed.php#L413-L420)
+
+```php
+public function nbNotRead(): int {
+    if ($this->nbNotRead < 0) {
+        $feedDAO = FreshRSS_Factory::createFeedDao();
+        $this->nbNotRead = $feedDAO->countNotRead($this->id());
+    }
+    return $this->nbNotRead;
+}
+```
+
+`countNotRead($id)` 直接按 feed_id 统计，**没有** feed.priority 过滤。
+
+**结论**：当用户点击某个隐藏 feed 查看时，其未读数仍会正确显示。但该 feed 的未读数不会被累加到全局或分类未读数中。
+
+### 10.4 标签未读数：包含隐藏来源
+
+**`TagDAO::countNotRead()`** — [TagDAO.php L286-L300](file:///d:/fz/0601-1/solo-dogfeeding/code/23-FreshRSS/app/Models/TagDAO.php#L286-L300)
+
+```sql
+SELECT COUNT(*) AS count FROM `_entrytag` et
+INNER JOIN `_entry` e ON et.id_entry=e.id
+WHERE e.is_read=0
+[AND et.id_tag=:id_tag]
+```
+
+SQL 只 JOIN `_entry`，不 JOIN `_feed`，因此**没有** feed.priority 过滤条件。
+
+**结论**：标签未读数统计包含所有来源，包括隐藏来源的文章。如果用户给隐藏来源的文章打了标签，其未读数会出现在标签统计中。
+
+### 10.5 前端 JS 未读数映射：排除隐藏来源
+
+**`nbUnreadsPerFeed.phtml`** — [nbUnreadsPerFeed.phtml L11-L12](file:///d:/fz/0601-1/solo-dogfeeding/code/23-FreshRSS/app/views/javascript/nbUnreadsPerFeed.phtml#L11-L12)
+
+```php
+if ($feed->priority() > FreshRSS_Feed::PRIORITY_HIDDEN) {
+    $result['feeds'][$feed->id()] = $feed->nbNotRead();
+}
+```
+
+**结论**：前端 JS 拿到的 feed 未读数映射表（供 `incUnreadsFeed()` 使用）也排除了隐藏来源，与侧栏显示保持一致。
+
+### 10.6 各计数器统计范围汇总表
+
+| 计数器 | 统计方法 | 优先级过滤 | 包含隐藏来源？ |
+|--------|---------|-----------|---------------|
+| 收藏总数 `total_starred['all']` | `JOIN _feed WHERE f.priority > -10` | `> PRIORITY_HIDDEN (-10)` | ❌ |
+| 收藏未读数 `total_starred['unread']` | 同上 | 同上 | ❌ |
+| 全局未读数 `total_unread` | `minPriority = MAIN_STREAM (10)` | `>= 10` | ❌ |
+| 重要未读数 `total_important_unread` | `minPriority = IMPORTANT (20)` | `>= 20` | ❌ |
+| 分类未读数 `cat.nbNotRead()` | `minPriority = FEED (-5)` | `>= -5` | ❌ |
+| Feed 未读数 `feed.nbNotRead()` | 按 feed_id 直接统计 | 无 | ✅（仅当查看该 feed 时） |
+| 标签未读数 `tag.nbUnread()` | `_entrytag JOIN _entry`，不 JOIN `_feed` | 无 | ✅ |
+| 前端 JS feed 映射 | `f.priority > -10` | `> PRIORITY_HIDDEN` | ❌ |
+
+---
+
+## 十一、进入收藏/标签视图时的默认状态自动调整
+
+进入不同视图时，Context 会**自动调整 `$state` 位掩码**，导致默认显示的读/收藏状态发生变化。这个逻辑集中在 [Context.php L250-L262](file:///d:/fz/0601-1/solo-dogfeeding/code/23-FreshRSS/app/Models/Context.php#L250-L262)。
+
+### 11.1 状态调整的执行顺序
+
+```php
+// Step 1: 先从请求参数取 state，或使用用户默认配置
+self::$state = Minz_Request::paramInt('state') 
+    ?: FreshRSS_Context::userConf()->default_state;
+
+// Step 2: 判断用户是否显式指定了 state（URL 中有 ?state=...）
+$state_forced_by_user = Minz_Request::paramString('state', plaintext: true) !== '';
+
+// Step 3: 只有用户没有显式指定时，才自动调整
+if (!$state_forced_by_user) {
+    // 自动调整逻辑...
+}
+```
+
+**关键**：如果用户在 URL 中显式指定了 `?state=...`，自动调整逻辑会被跳过，完全尊重用户选择。
+
+### 11.2 自动调整规则
+
+```php
+if (!$state_forced_by_user) {
+    if (FreshRSS_Context::userConf()->show_fav_unread 
+        && (self::isCurrentGet('s') || self::isCurrentGet('T') || self::isTag())) {
+        // Case 1: 收藏视图、所有标签视图、单个标签视图
+        // + 配置"始终显示收藏夹全部内容"开启
+        self::$state = FreshRSS_Entry::STATE_NOT_READ | FreshRSS_Entry::STATE_READ;
+    } elseif (FreshRSS_Context::userConf()->default_view === 'all') {
+        // Case 2: 默认视图配置为"显示全部"
+        self::$state = STATE_NOT_READ | STATE_READ;
+    } elseif (FreshRSS_Context::userConf()->default_view === 'unread_or_favorite') {
+        // Case 3: 默认视图配置为"显示未读或收藏"
+        self::$state = STATE_OR_NOT_READ | STATE_OR_FAVORITE;
+    } elseif (FreshRSS_Context::userConf()->default_view === 'adaptive' && self::$get_unread <= 0) {
+        // Case 4: 自适应视图且当前没有未读
+        self::$state = STATE_NOT_READ | STATE_READ;
+    }
+}
+```
+
+### 11.3 `show_fav_unread` 配置的影响
+
+`show_fav_unread`（"始终显示收藏夹全部内容"）在 [reading.phtml L152-L156](file:///d:/fz/0601-1/solo-dogfeeding/code/23-FreshRSS/app/views/configure/reading.phtml#L152-L156) 中配置，帮助文本明确说明："同样适用于标签"。
+
+**当配置为 true 时**：
+
+| 当前视图 | 自动设置的 state | 显示效果 |
+|---------|-----------------|----------|
+| 收藏夹 (`?get=s`) | `STATE_NOT_READ \| STATE_READ = 3` | 显示全部（已读+未读）收藏 |
+| 所有标签 (`?get=T`) | 同上 | 显示全部（已读+未读）带标签文章 |
+| 单个标签 (`?get=t_123`) | 同上 | 显示该标签下全部文章 |
+
+**为什么这样设计？**
+
+收藏和标签的定位是"知识库"而非"收件箱"。用户进入这些视图通常是想查阅所有已保存的内容，而不是仅看未读。因此当 `show_fav_unread=true` 时，进入这些视图会**自动忽略 `default_view` 配置**，强制显示全部。
+
+### 11.4 进入收藏视图时的额外强制位
+
+除了上述 state 调整，进入收藏视图 `_get('s')` 时还有额外处理 — [Context.php L492-L498](file:///d:/fz/0601-1/solo-dogfeeding/code/23-FreshRSS/app/Models/Context.php#L492-L498)：
+
+```php
+case 's':
+    self::$current_get['starred'] = true;
+    self::$get_unread = self::$total_starred['unread'];
+    // Update state if favorite is not yet enabled.
+    self::$state = self::$state | FreshRSS_Entry::STATE_FAVORITE;
+    break;
+```
+
+无论用户如何配置，进入收藏视图时都会**强制 `$state |= STATE_FAVORITE (4)`**，确保 SQL 查询的 WHERE 条件包含 `is_favorite=1`。这与 `sqlListWhere('s')` 中的硬编码条件 `AND e.is_favorite=1` 形成双重保险。
+
+### 11.5 状态变化对列表回显的影响链
+
+```
+用户点击侧栏"收藏夹"链接
+  → URL: .?get=s
+  → Context::updateUsingRequest()
+    → _get('s') → $state |= STATE_FAVORITE (强制只看收藏)
+    → 若 show_fav_unread=true 且用户未指定 ?state=
+      → $state = STATE_NOT_READ | STATE_READ (显示全部)
+    → 最终 $state = 1 | 2 | 4 = 7 (STATE_FAVORITE | STATE_ALL)
+  → EntryDAO::listByType('s', $state)
+    → sqlListWhere('s') → WHERE e.is_favorite=1 AND f.priority > -10
+    → sqlListEntriesWhere($state=7)
+      → STATE_ANDS (7 & 15 = 7) 不为 0
+      → STATE_FAVORITE (4) 已设，STATE_NOT_FAVORITE (8) 未设 → AND is_favorite=1
+      → STATE_NOT_READ (2) 和 STATE_READ (1) 同时为 true → 不生成 is_read 条件
+      → 最终 WHERE: is_favorite=1（显示全部收藏）
+  → 列表渲染时
+    → flux div 渲染 not_read / favorite class 基于数据库真实值
+    → 按钮 href 基于 $this->entry->isRead() 和 isFavorite()
+```
+
+---
+
+## 十二、SQL 查询拼接：状态位如何影响最终列表回显
+
+状态位掩码 `$state` 通过两个函数翻译成实际 SQL：**`sqlListWhere()`** 处理视图类型（get 参数），**`sqlListEntriesWhere()`** 处理状态位和搜索过滤。两者串联决定最终返回哪些条目。
+
+### 12.1 Feed 优先级阈值：`sqlListWhere()` 中的可见性控制
+
+[EntryDAO.php L1535-L1590](file:///d:/fz/0601-1/solo-dogfeeding/code/23-FreshRSS/app/Models/EntryDAO.php#L1535-L1590) 根据视图类型设置 feed 优先级下限：
+
+| `type` | 视图 | 优先级条件 | 说明 |
+|--------|------|-----------|------|
+| `'a'` | 全部（主流） | `f.priority >= min(MAIN_STREAM(10), needVisibility)` | 只显示主流及以上 |
+| `'A'` | 全部（含分类） | `f.priority >= min(CATEGORY(0), needVisibility)` | 显示分类级及以上 |
+| `'Z'` | 全部（含隐藏） | `1=1`（无限制） | 显示所有，包括隐藏 |
+| `'i'` | 重要 | `f.priority >= min(IMPORTANT(20), needVisibility)` | 只显示重要来源 |
+| `'s'` | 收藏 | `f.priority > min(HIDDEN(-10), needVisibility)` <br> **AND** `e.is_favorite=1` | 排除隐藏来源的收藏 |
+| `'c_*'` | 分类 | `f.priority >= min(CATEGORY(0), needVisibility)` <br> **AND** `f.category=?` | 分类内分类级及以上 |
+| `'f_*'` | Feed | `e.id_feed=?` | 不判断优先级（直接按 id） |
+| `'t_*'` | 单个标签 | `et.id_tag=?` | 不判断优先级（直接按标签关联） |
+| `'T'` | 所有标签 | `1=1`（无限制） | 不判断优先级 |
+
+`needVisibility` 来自搜索条件 [Search.php L538-L548](file:///d:/fz/0601-1/solo-dogfeeding/code/23-FreshRSS/app/Models/Search.php#L538-L548)：
+- 搜索包含 feed ID → `PRIORITY_HIDDEN (-10)`（允许访问隐藏来源）
+- 搜索包含 category ID → `PRIORITY_CATEGORY (0)`
+- 否则 → `PRIORITY_IMPORTANT (20)`
+
+**关键结论**：当用户通过搜索直接指定某个隐藏 feed 时，优先级限制会被放宽，用户可以看到该隐藏 feed 的内容。这是一个"显式选择即可见"的设计。
+
+### 12.2 状态位转 SQL：`sqlListEntriesWhere()`
+
+[EntryDAO.php L1394-L1519](file:///d:/fz/0601-1/solo-dogfeeding/code/23-FreshRSS/app/Models/EntryDAO.php#L1394-L1519) 把 `$state` 位掩码翻译成 WHERE 条件。
+
+#### ANDS 位（bits 1-8，值 1-15）处理：
+
+```php
+if ($state & STATE_ANDS) {  // 15 = 0b01111
+    if ($state & STATE_NOT_READ) {  // bit 2
+        if (!($state & STATE_READ)) {  // 只设 NOT_READ，不设 READ
+            $search .= 'AND (is_read=0) ';  // 只显示未读
+        }
+        // 同时设 NOT_READ 和 READ → 不生成条件（显示全部）
+    } elseif ($state & STATE_READ) {  // 只设 READ，不设 NOT_READ
+        $search .= 'AND (is_read=1) ';  // 只显示已读
+    }
+
+    if ($state & STATE_FAVORITE) {  // bit 4
+        if (!($state & STATE_NOT_FAVORITE)) {
+            $search .= 'AND (is_favorite=1) ';  // 只显示收藏
+        }
+    } elseif ($state & STATE_NOT_FAVORITE) {  // bit 8
+        $search .= 'AND (is_favorite=0) ';  // 只显示未收藏
+    }
+}
+```
+
+#### ORS 位（bits 6-7，值 32-64）处理：
+
+```php
+if ($state & STATE_ORS) {  // 96 = 0b1100000
+    if ($state & STATE_OR_NOT_READ) {  // bit 6 = 32
+        $search = rtrim($search, ') ');
+        $search .= ' OR is_read=0) ';   // 加上"或未读"
+    }
+    if ($state & STATE_OR_FAVORITE) {   // bit 7 = 64
+        $search = rtrim($search, ') ');
+        $search .= ' OR is_favorite=1) ';  // 加上"或收藏"
+    }
+}
+```
+
+### 12.3 常见状态组合对应的 SQL
+
+| state 值 | 常量组合 | ANDS 条件 | ORS 附加 | 最终效果 |
+|----------|---------|-----------|----------|----------|
+| 2 | `STATE_NOT_READ` | `is_read=0` | - | 只显示未读 |
+| 3 | `STATE_NOT_READ \| STATE_READ` | -（互斥抵消） | - | 显示全部 |
+| 6 | `STATE_NOT_READ \| STATE_FAVORITE` | `is_read=0 AND is_favorite=1` | - | 只显示未读收藏 |
+| 7 | `STATE_ALL \| STATE_FAVORITE` | `is_favorite=1` | - | 显示全部收藏 |
+| 96 | `STATE_ORS`（无 ANDS） | - | `(1=0 OR ...)` 占位 | 无有效条件 |
+| 32 | `STATE_OR_NOT_READ` | - | `(1=0 OR is_read=0)` | 只显示未读（同 state=2） |
+| 64 | `STATE_OR_FAVORITE` | - | `(1=0 OR is_favorite=1)` | 只显示收藏 |
+| 96 | `STATE_OR_NOT_READ \| STATE_OR_FAVORITE` | - | `(1=0 OR is_read=0 OR is_favorite=1)` | 显示未读 **或** 收藏 |
+
+> **注意 state=96 (`STATE_OR_NOT_READ | STATE_OR_FAVORITE`) 的特殊语义**：这是"未读或收藏"视图，用 OR 连接条件。即使一篇文章已读，只要它被收藏，也会显示。这与 state=6（未读 AND 收藏）的交集语义不同。
+
+### 12.4 完整 SQL 拼接流程
+
+以进入收藏视图（`?get=s`）且 `show_fav_unread=true` 为例：
+
+```php
+// Context 层
+$state = userConf()->default_state;  // 假设用户默认 state=2（只看未读）
+$state_forced_by_user = false;  // URL 中无 ?state=
+if (show_fav_unread && isCurrentGet('s')) {
+    $state = STATE_NOT_READ | STATE_READ;  // = 3，显示全部
+}
+_get('s') → $state |= STATE_FAVORITE;  // = 3 | 4 = 7
+
+// DAO 层 sqlListWhere('s')
+$where = "f.priority > -10 AND e.is_favorite=1 ";
+
+// DAO 层 sqlListEntriesWhere($state=7)
+$search = "AND (is_favorite=1) ";  // 来自 STATE_FAVORITE 位
+// STATE_NOT_READ 和 STATE_READ 同时为 true，不生成 is_read 条件
+
+// 最终 SQL
+SELECT e.id FROM `_entry` e USE INDEX (entry_feed_read_index)
+INNER JOIN `_feed` f ON f.id = e.id_feed
+WHERE f.priority > -10 AND e.is_favorite=1 AND (is_favorite=1)
+ORDER BY e.id DESC
+```
+
+注意 `e.is_favorite=1` 条件出现了两次——一次来自 `sqlListWhere('s')` 的视图类型硬编码，一次来自 `sqlListEntriesWhere()` 的 STATE_FAVORITE 位。数据库优化器会自动合并为等价条件，不影响执行计划。
+
+### 12.5 列表回显一致性的闭环
+
+状态条件在整条链路中**同源、同构**，确保了列表显示与用户预期一致：
+
+1. **渲染侧栏链接时**：`_url('index', $view, 'get', 's')` 生成 `?get=s`，不携带 state 参数，让自动调整逻辑生效
+2. **Context 层计算 state 时**：基于相同的 `get` 参数和 `show_fav_unread` 配置
+3. **DAO 层拼接 SQL 时**：基于同一个 `$state` 值
+4. **模板渲染按钮 href 时**：基于 `$this->entry->isRead()` / `isFavorite()`（即数据库当前值）
+5. **JS 增量更新时**：`incLabel()` 和 `incUnreadsTag()` 只修改数字文本，不改变列表内容
+
+下次页面刷新时，第 1-4 步重新执行，所有状态从数据库重新读取，完成一致性闭环。
