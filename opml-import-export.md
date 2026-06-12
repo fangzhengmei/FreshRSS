@@ -305,14 +305,16 @@ if ($cat_name !== '') {
 4. 文章通过 feedId 关联到已有订阅 → 分类正确保留
 ```
 
-**链路 B：仅导入文章 JSON（不推荐，分类丢失）**
+**链路 B：仅导入文章 JSON（不推荐，分类表现取决于 JSON 来源）**
 ```
-1. 导入文章 JSON → 从 origin.feedUrl 提取 URL
+1. 导入文章 JSON → 从 origin.feedUrl / streamId / htmlUrl 提取订阅线索
 2. searchByUrl() 未命中
 3. addFeedJson() 补建订阅 → origin.category 为空 → 进入默认分类
 4. 文章关联到新建订阅 → 所有订阅在默认分类下
-5. 原分类名以 user/-/label/分类名 形式出现在 categories 数组
+5. 若 JSON 来自 `compat`/外部 API 路径，原分类名还会以 `user/-/label/分类名` 出现在 categories
    → 被当作文章 Label 处理 → 每篇文章都打上原分类名作为标签
+6. 若 JSON 来自 FreshRSS 自导出的 `freshrss` 路径，则 categories 里本来就没有分类名
+   → 分类不会降级成 Label，而是直接只剩“订阅进入默认分类”这一层信息丢失
 ```
 
 ---
@@ -588,12 +590,14 @@ ExportService
 
 | 特性 | 表现 | 影响场景 |
 |------|------|----------|
-| **分类名与文章 Label 格式相同** | 都使用 `user/-/label/` 前缀，导入时无法区分 | 仅导入文章 JSON 时，原分类名变成每篇文章的 Label |
-| **`origin.category` 从未写入** | `toGReader()` 不输出该字段 | 仅导入文章 JSON 时，自动补建的订阅全部进入默认分类 |
+| **分类名与文章 Label 格式相同** | 都使用 `user/-/label/` 前缀，导入时无法区分 | `compat` / 外部 API 导出的文章 JSON 重新导入时，原分类名会变成每篇文章的 Label |
+| **`origin.category` 从未写入** | `toGReader()` 不输出该字段 | 任何只靠文章 JSON 自动补建订阅的场景，订阅都会进入默认分类 |
 | **重复订阅不迁移分类** | `addFeedObject()` UPDATE 不包含 category 字段 | 同一 URL 在不同分类的 OPML 中出现时，保留首次导入的分类 |
 | **订阅优先级导入时丢失** | `categories` 中 `state/org.freshrss/*` 在导入时被丢弃 | 文章导入不会恢复订阅的 main/important/hidden 优先级 |
 | **`freshrss` 模式不写分类名** | `mode !== 'freshrss'` 才写入 `user/-/label/分类名` | 自导出文章 JSON 不含分类名信息 |
 | **`streamId` 是数据库自增 ID** | `'feed/' + feedId` 跨实例不匹配 | 跨实例迁移时 streamId 无用，必须依赖 `origin.feedUrl` |
+| **标签与分类同名时静默失败** | `TagDAO::addTag()` 的 `WHERE NOT EXISTS` 防同名 | Label 名与已有分类相同时，标签不创建、关联不建立，无任何提示 |
+| **双约束叠加导致信息完全丢失** | 重复订阅不换分类 + 标签与分类同名冲突 | 原分类信息既不体现在订阅分类上，也不作为标签保留，完全静默丢失 |
 
 ### 9.3 正确的导出+导入流程（完整保留所有信息）
 
@@ -610,4 +614,42 @@ ExportService
     3. 订阅文章 JSON → 同上
 ```
 
-如果跳过 OPML 仅导入文章 JSON，分类信息会降级为文章 Label，订阅进入默认分类。
+如果跳过 OPML 仅导入文章 JSON，FreshRSS 自导出的 `freshrss` JSON 会让订阅进入默认分类；`compat` 或外部 API JSON 则还会把原分类名降级成文章 Label。
+
+---
+
+## 十、`freshrss` 自导出路径与 `compat` API 路径的最终归纳
+
+### 10.1 两条文章 JSON 导出路径的调用点
+
+| 路径 | 调用位置 | `toGReader()` 模式 | 分类名是否写入 `categories` | `origin.feedUrl` |
+|------|----------|--------------------|------------------------------|------------------|
+| FreshRSS 内部导出 ZIP | `app/views/helpers/export/articles.phtml` | `freshrss` | ❌ 不写入 | ✅ 写入 |
+| Google Reader 兼容 API | `p/api/greader.php` | `compat` | ✅ 写入 `user/-/label/分类名` | ❌ 不写入 |
+
+这两条路径都复用 `FreshRSS_Entry::toGReader()`，但因为传入模式不同，导出的分类信息落点完全不同：内部导出依赖 `origin.feedUrl + OPML` 复原订阅结构，兼容 API 则把分类名挤进 `categories`，与文章 Label 共用同一前缀。
+
+### 10.2 三种容易混淆的实际结果
+
+1. **只导入 FreshRSS 自导出的文章 JSON，不配合 OPML**
+   - `origin.feedUrl` 仍然存在，所以能补建订阅或命中已有订阅。
+   - 但 `freshrss` 模式不写分类名，也从不写 `origin.category`，所以新建订阅会进入默认分类。
+   - 这里不会出现“分类名变成文章 Label”，因为 JSON 中根本没有那条 `user/-/label/分类名`。
+
+2. **导入 `compat` / 外部 API JSON**
+   - 分类名会作为 `user/-/label/分类名` 进入 `categories`。
+   - `importJson()` 只按正则把这类值识别为文章 Label，不会回填订阅分类。
+   - 因此它表现为“订阅分类无法恢复，分类名降级成每篇文章的 Label”。
+
+3. **`compat` JSON 中的分类名又与目标实例已有分类同名**
+   - `TagDAO::addTag()` 明确禁止创建与 `_category.name` 同名的标签。
+   - `importJson()` 在拿到 `false` 的标签 ID 后直接跳过关联，不抛异常，也不提示用户。
+   - 最终结果是：分类既没有恢复成订阅分类，也没有保留下来作为文章 Label，信息会静默丢失。
+
+### 10.3 为什么 OPML 仍然是完整迁移的关键
+
+只要 OPML 先导入，订阅会先按正确分类创建好，后续文章 JSON 再通过 URL 命中已有订阅，订阅分类就能保住。此时：
+
+- `freshrss` JSON 负责恢复文章本身、星标、已读状态和用户 Label；
+- `compat` JSON 即使继续把分类名当成 Label 处理，也不会再改变订阅所属分类；
+- 标签同名冲突最多影响“是否额外保留一个同名文章 Label”，不会再改变订阅已经落到哪个分类。
