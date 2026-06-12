@@ -23,14 +23,16 @@ FreshRSS 提供 **五套** 独立的 API 兼容协议入口，它们最终都收
 └──────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 三条能力主线
+### 六条能力主线
+
+> WebSub（pshb.php）虽然执行订阅刷新（写入），但其**完全不受全局 `api_enabled` 开关控制**，独立于用户 API 体系之外。
 
 | 能力主线 | GReader 入口 | Fever 入口 | Query 入口 | WebSub 入口 | Misc 入口 | 收束的 DAO/Controller 方法 |
 |---|---|---|---|---|---|---|
 | **条目（读）** | `stream/contents`, `stream/items/ids`, `stream/items/contents` | `items`, `unread_item_ids`, `saved_item_ids` | `greader`, `json`, `rss`, `atom`, `html` 导出（只读） | — | 扩展自行实现 | `EntryDAO.listWhere`, `listIdsWhere`, `listByIds`, `FreshRSS_index_Controller::listEntriesByContext` |
 | **条目（写）** | `edit-tag`, `mark-all-as-read` | `mark=item/feed/group as=read/unread/saved/unsaved` | — | — | 扩展自行实现 | `EntryDAO.markRead`, `markFavorite`, `markReadEntries/Cat/Feed/Tag`, `TagDAO.tagEntry` |
 | **订阅（读）** | `subscription/list`, `subscription/export`, `tag/list` | `feeds`, `groups`, `feeds_groups`, `favicons` | `opml` 导出（只读） | — | 扩展自行实现 | `FeedDAO.listFeeds`, `CategoryDAO.listCategories`, `TagDAO.listTags`, `FreshRSS_Export_Service::generateOpml` |
-| **订阅（写）** | `subscription/edit`, `subscription/quickadd`, `subscription/import` | 无订阅写入口 | — | 推送触发 `actualizeFeedsAndCommit` | 扩展自行实现 | `FreshRSS_feed_Controller::addFeed/deleteFeed/moveFeed/renameFeed`, `FreshRSS_Import_Service::importOpml` |
+| **订阅（写）** | `subscription/edit`, `subscription/quickadd`, `subscription/import` | 无订阅写入口 | — | 推送触发 `actualizeFeedsAndCommit`（不受 api_enabled 控制） | 扩展自行实现 | `FreshRSS_feed_Controller::addFeed/deleteFeed/moveFeed/renameFeed/actualizeFeedsAndCommit`, `FreshRSS_Import_Service::importOpml` |
 | **标签/分类（写）** | `rename-tag`, `disable-tag` | 无标签写入口 | — | — | 扩展自行实现 | `CategoryDAO.updateCategory/deleteCategory/addCategory`, `TagDAO.updateTagName/deleteTag/addTag` |
 | **共享查询（读）** | — | — | `atom`, `greader`, `html`, `json`, `opml`, `rss` 全格式 | — | — | `FreshRSS_UserQuery` → `FreshRSS_index_Controller::listEntriesByContext` |
 
