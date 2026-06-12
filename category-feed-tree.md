@@ -164,7 +164,14 @@ ORDER BY c.name, f.name
     null === $position ? '' : " data-position='$position'" ?> data-unread="<?= $cat->nbNotRead() ?>"<?= $hideSucCat ?>>
 ```
 
-该 `data-position` 可供前端 JavaScript 做拖拽排序等交互使用。
+#### 2.4.1 `data-position` 的真实用途
+
+经过对整个代码库的全面搜索（`**/*.js` 和 `**/*.php`），`data-position` 属性仅在 [aside_feed.phtml](file:///d:/fz/0601-1/solo-dogfeeding/code/22-FreshRSS/app/layout/aside_feed.phtml) 中被输出到 HTML，在 FreshRSS 核心的 JavaScript 和 PHP 代码中均无任何读取或使用的引用。
+
+其真实用途是：
+- 作为 HTML5 `data-*` 自定义属性，将分类的 `attributes.position` 整数值暴露给前端 DOM
+- 供第三方前端扩展（如自定义拖拽排序插件）读取和使用
+- FreshRSS 核心代码当前未直接依赖该属性，属于预留的扩展钩子
 
 ---
 
