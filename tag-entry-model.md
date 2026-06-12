@@ -23,7 +23,7 @@ FreshRSS 中存在**两套独立的标签体系**：
 | `name` | VARCHAR(191) (UNIQUE) | 标签名称（唯一，与分类名不可重名） |
 | `attributes` | TEXT | 扩展属性（JSON 格式），存储过滤动作等配置 |
 
-> 代码参考：[install.sql.mysql.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-FreshRSS/app/SQL/install.sql.mysql.php#L96-L103)
+> 代码参考：[app/SQL/install.sql.mysql.php](app/SQL/install.sql.mysql.php#L96-L103)
 
 ### 2.2 文章-标签关联表 `_entrytag`
 
@@ -41,7 +41,7 @@ FOREIGN KEY (id_tag) REFERENCES _tag(id) ON DELETE CASCADE ON UPDATE CASCADE
 FOREIGN KEY (id_entry) REFERENCES _entry(id) ON DELETE CASCADE ON UPDATE CASCADE
 ```
 
-> 代码参考：[install.sql.mysql.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-FreshRSS/app/SQL/install.sql.mysql.php#L105-L113)
+> 代码参考：[app/SQL/install.sql.mysql.php](app/SQL/install.sql.mysql.php#L105-L113)
 
 ### 2.3 与 Feed 源标签的区别
 
@@ -56,7 +56,7 @@ FOREIGN KEY (id_entry) REFERENCES _entry(id) ON DELETE CASCADE ON UPDATE CASCADE
 | 搜索过滤 | 直接在 `_entry.tags` 字段上做 LIKE/REGEXP | 通过 JOIN `_entrytag` + `_tag` 表查询 |
 | 存储限制 | VARCHAR(2048)，标签数量有限制 | 无限制，每行一条关联 |
 
-> 代码参考：[Entry.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-FreshRSS/app/Models/Entry.php#L38-L39)、[EntryDAO.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-FreshRSS/app/Models/EntryDAO.php#L231-L233)
+> 代码参考：[app/Models/Entry.php](app/Models/Entry.php#L38-L39)、[app/Models/EntryDAO.php](app/Models/EntryDAO.php#L231-L233)
 
 ---
 
@@ -64,7 +64,7 @@ FOREIGN KEY (id_entry) REFERENCES _entry(id) ON DELETE CASCADE ON UPDATE CASCADE
 
 ### 3.1 标签模型 `FreshRSS_Tag`
 
-位置：[app/Models/Tag.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-FreshRSS/app/Models/Tag.php)
+位置：[app/Models/Tag.php](app/Models/Tag.php)
 
 **核心属性**：
 - `$id` (int) - 标签 ID
@@ -88,7 +88,7 @@ FreshRSS_TagDAO (基类，MySQL 默认)
 
 工厂创建方式：`FreshRSS_Factory::createTagDao()`
 
-**基类**：[app/Models/TagDAO.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-FreshRSS/app/Models/TagDAO.php)
+**基类**：[app/Models/TagDAO.php](app/Models/TagDAO.php)
 
 **核心方法一览**：
 
@@ -111,9 +111,9 @@ FreshRSS_TagDAO (基类，MySQL 默认)
 | `countEntries($id)` | 统计标签关联的文章数 |
 | `countNotRead($id)` | 统计标签下的未读文章数 |
 
-**SQLite 子类**：[TagDAOSQLite.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-FreshRSS/app/Models/TagDAOSQLite.php) - 仅覆盖 `sqlIgnore()` 返回 `OR IGNORE`
+**SQLite 子类**：[app/Models/TagDAOSQLite.php](app/Models/TagDAOSQLite.php) - 仅覆盖 `sqlIgnore()` 返回 `OR IGNORE`
 
-**PostgreSQL 子类**：[TagDAOPGSQL.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-FreshRSS/app/Models/TagDAOPGSQL.php) - 覆盖 `sqlIgnore()` 和 `sqlResetSequence()`
+**PostgreSQL 子类**：[app/Models/TagDAOPGSQL.php](app/Models/TagDAOPGSQL.php) - 覆盖 `sqlIgnore()` 和 `sqlResetSequence()`
 
 ---
 
@@ -123,7 +123,7 @@ FreshRSS_TagDAO (基类，MySQL 默认)
 
 **入口 Controller**：`tag/addAction`
 
-位置：[tagController.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-FreshRSS/app/Controllers/tagController.php#L159-L186)
+位置：[app/Controllers/tagController.php](app/Controllers/tagController.php#L159-L186)
 
 **流程**：
 1. 用户在标签管理页面提交表单（POST 请求，参数 `name`）
@@ -138,7 +138,7 @@ FreshRSS_TagDAO (基类，MySQL 默认)
 
 **入口 Controller**：`tag/tagEntryAction`
 
-位置：[tagController.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-FreshRSS/app/Controllers/tagController.php#L31-L64)
+位置：[app/Controllers/tagController.php](app/Controllers/tagController.php#L31-L64)
 
 **流程**：
 1. 用户在文章上打一个**不存在的标签**
@@ -162,43 +162,359 @@ FreshRSS_TagDAO (基类，MySQL 默认)
 
 ## 五、打标入口（文章关联标签的途径）
 
-### 5.1 Web UI 手动打标
+### 5.1 Web UI 手动打标 - 完整流程
 
-**视图**：文章详情中的标签管理区域
+#### 5.1.1 标签下拉菜单的触发与加载
 
-相关视图：
-- [getTagsForEntry.phtml](file:///d:/fz/0601-1/solo-dogfeeding/code/25-FreshRSS/app/views/tag/getTagsForEntry.phtml) - AJAX 获取文章标签 JSON
-- [tag/index.phtml](file:///d:/fz/0601-1/solo-dogfeeding/code/25-FreshRSS/app/views/tag/index.phtml) - 标签管理页面
+**HTML 入口**：每篇文章头部有一个标签图标按钮
 
-**交互流程**：
+位置：[app/views/helpers/index/normal/entry_header.phtml](app/views/helpers/index/normal/entry_header.phtml#L83-L89)
+
+```html
+<div class="item-element dropdown dynamictags">
+    <div id="dropdown-labels2-{entryId}" class="dropdown-target"></div>
+    <a class="dropdown-toggle" href="#dropdown-labels2-{entryId}">
+        <?= _i('label') ?>  <!-- 标签图标 -->
+    </a>
+</div>
 ```
-文章底部 → 我的标签下拉 → 勾选/取消勾选标签 → AJAX POST 到 tag/tagEntryAction
+
+**点击触发流程**：
+
+```
+用户点击标签图标
+    ↓
+JS 事件捕获：点击 .item.labels a.dropdown-toggle
+    ↓
+调用 show_labels_menu(el)  [main.js L780]
+    ↓
+检查：下拉菜单是否已存在？且 forceReloadLabelsList=false？
+    ├── 否（首次打开或强制重载）→ 加载模板 + 调用 loadDynamicTags()
+    └── 是 → 直接显示已缓存的菜单（无需重复请求）
 ```
 
-### 5.2 控制器打标动作 `tagEntryAction`
+> 代码参考：[p/scripts/main.js](p/scripts/main.js#L780-L797)
 
-位置：[tagController.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-FreshRSS/app/Controllers/tagController.php#L31-L64)
+#### 5.1.2 `loadDynamicTags()` - 标签列表 AJAX 加载
 
-**请求参数**：
-- `id_tag` (int) - 标签 ID（可选，与 `name_tag` 二选一）
-- `name_tag` (string) - 标签名称（可选，不存在则自动创建）
-- `id_entry` (string) - 文章 ID
-- `checked` (bool) - `true`=打标，`false`=取消打标
-- `ajax` (bool) - 是否 AJAX 请求（影响响应方式）
+位置：[p/scripts/main.js](p/scripts/main.js#L1696-L1795)
 
-**底层调用 `TagDAO::tagEntry()`**：
+**加载流程详解**：
+
+```
+1. 清空下拉菜单中已有的 <li.item> 元素
+2. 从当前文章 DOM 获取文章 ID：flux_{id} → id
+3. 发送 GET 请求：
+   URL: ./?c=tag&a=getTagsForEntry&id_entry={entryId}
+   Header: Accept: application/json
+    ↓
+4. 后端处理：getTagsForEntryAction()
+   调用 TagDAO::getTagsForEntry($id_entry)
+   SQL: SELECT t.id, t.name, et.id_entry IS NOT NULL as checked
+        FROM _tag t
+        LEFT OUTER JOIN _entrytag et ON et.id_tag = t.id AND et.id_entry=:id_entry
+        ORDER BY t.name
+    ↓
+5. 接收 JSON 数组：
+   [{id:1, name:"重要", checked:true}, {id:2, name:"待读", checked:false}, ...]
+    ↓
+6. 动态构建 DOM：
+   a. 登录用户：添加"新建标签"行
+      - 隐藏的 checkbox (name="t_0", class="checkboxTag checkboxNewTag")
+      - 文本输入框 (class="newTag") + 自动补全 datalist
+      - "+" 按钮
+   b. 遍历 JSON，为每个标签生成一行：
+      <li class="item">
+        <label>
+          <input class="checkboxTag" name="t_{id}" type="checkbox" [checked]>
+          {标签名称}
+        </label>
+      </li>
+   c. 填充 datalist-labels 自动补全选项
+```
+
+**后端返回格式**（[app/views/tag/getTagsForEntry.phtml](app/views/tag/getTagsForEntry.phtml)）：
+```php
+echo json_encode($this->tagsForEntry);
+```
+
+**为什么使用 `LEFT OUTER JOIN` + `checked` 字段？**
+- `LEFT JOIN` 保证返回**所有**标签，即使文章没有打这个标签
+- `et.id_entry IS NOT NULL as checked` 直接在 SQL 层计算出该文章是否已打此标签
+- 前端直接用 `checked` 字段设置 checkbox 的勾选状态，无需额外计算
+
+#### 5.1.3 勾选标签 - 请求字段详解
+
+**事件绑定**：`stream.onchange` 监听 `.checkboxTag` 的变化
+
+位置：[p/scripts/main.js](p/scripts/main.js#L1592-L1654)
+
+**勾选后的处理流程**：
+
+```
+checkbox 状态变化
+    ↓
+1. 解析参数：
+   tagId   = checkbox.name.replace(/^t_/, '')   // "t_5" → "5"，新建标签为 "0"
+   tagName = checkbox 后续输入框的值             // 仅新建标签时有值
+   isChecked = checkbox.checked                  // true/false
+   entryId   = 从最近 .flux 元素 id 中提取         // "flux_123456" → "123456"
+    ↓
+2. 参数合法性校验：
+   if ((tagId == 0 && tagName.length > 0) || tagId != 0)
+   ├── 新建标签场景：tagId=0，必须填写 tagName
+   └── 已有标签场景：tagId≠0，不需要 tagName
+    ↓
+3. 禁用 checkbox，防止重复提交
+    ↓
+4. 发送 POST 请求：
+   URL: ./?c=tag&a=tagEntry&ajax=1
+   Method: POST
+   Content-Type: application/json; charset=utf-8
+   Body: JSON.stringify({
+       _csrf:     context.csrf,        // CSRF 令牌
+       id_tag:    tagId,              // 标签ID（0=新建）
+       name_tag:  tagId==0 ? tagName : '',  // 新标签名称
+       id_entry:  entryId,            // 文章ID
+       checked:   isChecked,          // true=打标/false=取消
+       ajax:      1                    // AJAX 请求标记
+   })
+```
+
+**请求字段对照表**：
+
+| 字段 | 类型 | 说明 | 示例值 |
+|------|------|------|--------|
+| `_csrf` | string | CSRF 防跨站伪造令牌 | `"abc123..."` |
+| `id_tag` | int | 标签 ID。**0 表示新建标签**，非 0 为已有标签 | `5` 或 `0` |
+| `name_tag` | string | 新建标签时的名称。**仅当 id_tag=0 时有效** | `"重要"` 或 `""` |
+| `id_entry` | string | 文章 ID（微秒时间戳字符串） | `"1718123456000000"` |
+| `checked` | bool | 打标动作：`true`=打标，`false`=取消打标 | `true` |
+| `ajax` | int | 是否为 AJAX 请求（影响响应方式） | `1` |
+
+#### 5.1.4 后端处理 `tagEntryAction`
+
+位置：[app/Controllers/tagController.php](app/Controllers/tagController.php#L31-L64)
+
+**处理逻辑**：
 
 ```php
-// checked=true: INSERT IGNORE INTO _entrytag(id_tag, id_entry) VALUES(...)
-// checked=false: DELETE FROM _entrytag WHERE id_tag=... AND id_entry=...
-public function tagEntry(int $id_tag, string $id_entry, bool $checked = true): bool
+// 1. 权限检查
+if (!FreshRSS_Auth::hasAccess()) { Minz_Error::error(403); }
+
+// 2. 仅接受 POST
+if (Minz_Request::isPost()) {
+    $id_tag    = Minz_Request::paramInt('id_tag');        // 0 或 >0
+    $name_tag  = Minz_Request::paramString('name_tag');   // 新建时的名称
+    $id_entry  = Minz_Request::paramString('id_entry');   // 文章ID
+    $checked   = Minz_Request::paramBoolean('checked');   // 打/取消标
+
+    if ($id_entry != '') {
+        $tagDAO = FreshRSS_Factory::createTagDao();
+
+        // 3. 隐式创建：id_tag=0 且 要打标（非取消）且 有名称
+        if ($id_tag == 0 && $name_tag !== '' && $checked) {
+            $existing_tag = $tagDAO->searchByName($name_tag);
+            if ($existing_tag !== null) {
+                // 标签名已存在 → 复用已有ID
+                $tagDAO->tagEntry($existing_tag->id(), $id_entry, $checked);
+            } else {
+                // 标签不存在 → 自动创建，返回新ID
+                $id_tag = $tagDAO->addTag(['name' => $name_tag]);
+            }
+        }
+
+        // 4. 建立/删除关联
+        if ($id_tag != false) {
+            $tagDAO->tagEntry($id_tag, $id_entry, $checked);
+        }
+    }
+}
 ```
 
-> 代码参考：[TagDAO.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-FreshRSS/app/Models/TagDAO.php#L302-L324)
+**底层 SQL（`TagDAO::tagEntry()`）**：
+- `checked=true`: `INSERT IGNORE INTO _entrytag(id_tag, id_entry) VALUES(:id_tag, :id_entry)`
+- `checked=false`: `DELETE FROM _entrytag WHERE id_tag=:id_tag AND id_entry=:id_entry`
 
-### 5.3 批量打标 `tagEntries()`
+> 代码参考：[app/Models/TagDAO.php](app/Models/TagDAO.php#L302-L324)
 
-位置：[TagDAO.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-FreshRSS/app/Models/TagDAO.php#L330-L356)
+#### 5.1.5 勾选后的回写 - 未读数与标签列表
+
+**成功响应回调 `req.onload`**（[p/scripts/main.js](p/scripts/main.js#L1611-L1617)）：
+
+```js
+req.onload = function (e) {
+    if (this.status != 200) { return req.onerror(e); }
+
+    // ★ 核心回写逻辑：侧栏标签未读数 +1/-1
+    if (entry.classList.contains('not_read')) {
+        // 文章当前是未读状态，打标会影响未读计数
+        // isChecked=true → +1（给标签增加1个未读）
+        // isChecked=false → -1（给标签减少1个未读）
+        incUnreadsTag('t_' + tagId, isChecked ? 1 : -1);
+    }
+};
+```
+
+**`incUnreadsTag()` 函数**（[p/scripts/main.js](p/scripts/main.js#L184-L196)）：
+
+```js
+function incUnreadsTag(tag_id, nb) {
+    // 1. 更新侧栏中具体标签的未读数
+    //    DOM: <li id="t_5" ...> <span class="item-title" data-unread="3">
+    let t = document.getElementById(tag_id);  // "t_5"
+    if (t) {
+        const unreads = str2int(t.getAttribute('data-unread'));
+        t.setAttribute('data-unread', unreads + nb);
+        t.querySelector('.item-title').setAttribute(
+            'data-unread', numberFormat(unreads + nb)
+        );
+    }
+
+    // 2. 更新侧栏中"我的标签"总文件夹的未读数
+    //    DOM: <li class="category tags ..."> <span class="title" data-unread="10">
+    t = document.querySelector('.category.tags .title');
+    if (t) {
+        const unreads = str2int(t.getAttribute('data-unread'));
+        t.setAttribute('data-unread', numberFormat(unreads + nb));
+    }
+}
+```
+
+> **关键前提**：仅当文章当前是**未读**（`.not_read`）时才更新未读数。已读文章的打标/取消打标不影响未读统计。
+
+**请求结束回调 `req.onloadend`**（[p/scripts/main.js](p/scripts/main.js#L1619-L1641)）：
+
+```js
+req.onloadend = function (e) {
+    checkboxTag.disabled = false;  // 重新启用 checkbox
+
+    if (tagId == 0) {
+        // ★ 新建标签分支
+        forceReloadLabelsList = true;              // ① 设置全局强制刷新标志
+        loadDynamicTags(checkboxTag.closest('div.dropdown'));  // ② 立即刷新当前菜单
+    } else {
+        // 已有标签分支：清理其他重复的下拉菜单 DOM
+        // （一篇文章可能有多个标签入口：头部和底部）
+        const dropdownmenu_current = ev.target.closest('.dropdown-menu');
+        const flux = ev.target.closest('.flux');
+        const dropdownmenu_all = flux.querySelectorAll('.dynamictags .dropdown-menu');
+        if (dropdownmenu_all.length > 1) {
+            dropdownmenu_all.forEach(function (currentValue) {
+                if (currentValue !== dropdownmenu_current) {
+                    // 删除非当前的菜单，下次打开时会重新拉取（保证状态一致）
+                    currentValue.nextElementSibling.remove();
+                    currentValue.parentNode.removeChild(currentValue);
+                }
+            });
+        }
+    }
+};
+```
+
+### 5.2 新增标签后为什么要强制刷新列表？
+
+**全局变量定义**（[p/scripts/main.js](p/scripts/main.js#L1691-L1694)）：
+
+```js
+// forceReloadLabelsList 默认值为 false，第二次及以后打开菜单时不需要重新加载
+// 当添加新标签时将被设置为 true，之后每次打开标签菜单都会重新拉取
+// 目的：最小化网络请求流量
+let forceReloadLabelsList = false;
+```
+
+#### 强制刷新的触发时机
+
+```
+用户勾选"新建标签"复选框 → tagId=0
+    ↓
+onloadend 回调中：
+    forceReloadLabelsList = true          // 设置全局标志
+    loadDynamicTags(当前dropdown)         // 立即刷新当前文章的菜单
+```
+
+#### 为什么需要强制刷新？三个原因
+
+| 原因 | 说明 |
+|------|------|
+| **1. 新标签需要出现在所有文章的菜单中** | 新标签被创建后，它应该出现在**所有文章**的标签下拉菜单里，而不只是当前这篇。如果不刷新，其他文章的菜单还是旧的缓存列表，用户找不到新标签。 |
+| **2. 新标签 ID 从 0 变为实际 ID** | 新建时 `tagId=0` 是临时占位，数据库插入后返回实际 ID。下次打同一个标签时必须用真实 ID，否则会重复创建。只有重新拉取才能拿到正确的 `id:数字` 数据。 |
+| **3. 所有文章的 `checked` 状态可能变化** | 新建标签后，当前文章已打了这个标签（`checked=true`），其他文章没有。只有重新查询 `getTagsForEntry` 才能反映出正确的勾选状态。 |
+
+#### `show_labels_menu()` 中的检查逻辑
+
+```js
+async function show_labels_menu(el) {
+    const div = el.parentElement;
+    const dropdownMenu = div.querySelector('.dropdown-menu');
+
+    // ★ 核心判断：菜单不存在 OR 强制刷新标志为true
+    if (!dropdownMenu || forceReloadLabelsList) {
+        if (dropdownMenu) {
+            // 删除旧菜单 DOM
+            dropdownMenu.nextElementSibling.remove();
+            dropdownMenu.remove();
+        }
+        // 加载模板 + AJAX 拉取最新标签列表
+        const template = document.getElementById('labels_article_template').innerHTML;
+        div.insertAdjacentHTML('beforeend', template);
+        return loadDynamicTags(div.closest('.dynamictags'));
+    }
+    return true;  // 否则直接复用已有 DOM，不发请求
+}
+```
+
+#### 性能优化：`forceReloadLabelsList` 的生命周期
+
+```
+初始状态: forceReloadLabelsList = false
+  ↓
+用户打开文章A标签菜单 → 发请求，缓存菜单DOM
+  ↓
+用户再次打开文章A菜单 → 不发请求，直接显示缓存 ★（流量优化点）
+  ↓
+用户在文章B中**新建**了一个标签
+  ↓
+onloadend 回调: forceReloadLabelsList = true
+  ↓
+用户打开任意文章的菜单 → 判断为 true → 删除旧缓存 → 重新AJAX拉取
+  ↓
+获取包含新标签的最新列表 → 重新缓存DOM
+  ↓
+后续打开 → 继续复用缓存，直到下一次新建标签
+```
+
+> 这个设计是**性能与正确性的权衡**：平时不开新标签时，所有文章共用一份缓存列表（零网络请求）；只有开新标签后才需要多花一次请求来保证数据一致。
+
+### 5.3 侧栏标签列表的 HTML 结构（未读数回写目标）
+
+位置：[app/layout/aside_feed.phtml](app/layout/aside_feed.phtml#L69-L94)
+
+```html
+<li id="tags" class="tree-folder category tags" data-unread="10">
+  <a href="...?get=T" class="tree-folder-title">
+    <button class="dropdown-toggle">...</button>
+    <span class="title" data-unread="10">我的标签</span>
+    <!-- ★ 总未读数回写点：.category.tags .title 的 data-unread 属性 -->
+  </a>
+  <ul class="tree-folder-items">
+    <?php foreach ($this->tags as $tag): ?>
+    <li id="t_<?= $tag->id() ?>" class="item feed" data-unread="<?= $tag->nbUnread() ?>">
+      <!-- ★ 单个标签未读数回写点：#t_{id} 的 data-unread 属性 -->
+      <a class="item-title" data-unread="<?= format_number($tag->nbUnread()) ?>"
+         href="...?get=t_<?= $tag->id() ?>">
+        <?= _i('label') ?> <?= $tag->name() ?>
+        <!-- ★ item-title 子元素也有 data-unread，用于显示格式化后的数字 -->
+      </a>
+    </li>
+    <?php endforeach; ?>
+  </ul>
+</li>
+```
+
+### 5.4 批量打标 `tagEntries()`
+
+位置：[app/Models/TagDAO.php](app/Models/TagDAO.php#L330-L356)
 
 支持一次对多篇文章打多个标签，使用 `INSERT IGNORE` 批量插入。
 
@@ -211,11 +527,9 @@ public function tagEntry(int $id_tag, string $id_entry, bool $checked = true): b
 ]
 ```
 
-### 5.4 自动打标（过滤规则驱动）
+### 5.5 自动打标（过滤规则驱动）
 
 **核心机制**：通过 `FreshRSS_FilterActionsTrait` 为标签配置过滤规则，当新文章入库时自动匹配并打标。
-
-位置：[FilterActionsTrait.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-FreshRSS/app/Models/FilterActionsTrait.php)
 
 #### 自动打标触发流程
 
@@ -231,8 +545,7 @@ feed 更新 → 新文章写入 _entrytmp → commitNewEntries()
 ```
 
 **关键代码**：
-- 触发入口：[feedController.php::applyLabelActions()](file:///d:/fz/0601-1/solo-dogfeeding/code/25-FreshRSS/app/Controllers/feedController.php#L879-L901)
-- 过滤匹配：[FilterActionsTrait.php::applyFilterActions()](file:///d:/fz/0601-1/solo-dogfeeding/code/25-FreshRSS/app/Models/FilterActionsTrait.php#L125-L153)
+- 触发入口：[app/Controllers/feedController.php](app/Controllers/feedController.php#L879-L901)
 - 过滤规则配置存储在标签的 `attributes.filters` JSON 字段中
 
 #### 过滤规则匹配动作
@@ -244,9 +557,9 @@ feed 更新 → 新文章写入 _entrytmp → commitNewEntries()
 
 > **重要**：自动打标只对**新入库的文章**生效（`!$entry->isUpdated()`），避免覆盖用户手动操作。
 
-### 5.5 GReader API 打标
+### 5.6 GReader API 打标
 
-**接口**：`/api/greader.php` 的 `edit-tag` 端点
+**接口**：`/p/api/greader.php` 的 `edit-tag` 端点
 
 **参数**：
 - `a` - 要添加的标签（可重复），格式 `user/-/label/标签名`
@@ -275,13 +588,13 @@ FOREIGN KEY (id_entry) REFERENCES _entry(id) ON DELETE CASCADE ON UPDATE CASCADE
 2. 文章删除后，其所有标签关联**自动清理**，不会产生孤儿记录
 3. **应用层代码无需手动维护关联关系的删除**，全部由数据库保证引用完整性
 
-> 代码参考：[install.sql.mysql.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-FreshRSS/app/SQL/install.sql.mysql.php#L109-L110)
+> 代码参考：[app/SQL/install.sql.mysql.php](app/SQL/install.sql.mysql.php#L109-L110)
 
 ### 6.2 应用层删除逻辑
 
 **DAO 方法**：`FreshRSS_TagDAO::deleteTag($id)`
 
-位置：[TagDAO.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-FreshRSS/app/Models/TagDAO.php#L122-L139)
+位置：[app/Models/TagDAO.php](app/Models/TagDAO.php#L122-L139)
 
 代码非常简洁，仅执行一条 DELETE SQL：
 
@@ -300,7 +613,7 @@ public function deleteTag(int $id): int|false {
 
 **动作**：`tag/deleteAction`
 
-位置：[tagController.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-FreshRSS/app/Controllers/tagController.php#L66-L85)
+位置：[app/Controllers/tagController.php](app/Controllers/tagController.php#L66-L85)
 
 **流程**：
 1. 接收 POST 参数 `id_tag`
@@ -311,7 +624,7 @@ public function deleteTag(int $id): int|false {
 
 **动作**：`tag/renameAction`
 
-位置：[tagController.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-FreshRSS/app/Controllers/tagController.php#L192-L225)
+位置：[app/Controllers/tagController.php](app/Controllers/tagController.php#L192-L225)
 
 当用户将标签 A 重命名为标签 B（标签 B 已存在）时，执行**合并操作**：
 
@@ -327,7 +640,7 @@ public function deleteTag(int $id): int|false {
 1. **先删重复**：删除那些同一篇文章同时打了源标签和目标标签的源标签关联（否则 UPDATE 会产生重复主键）
 2. **再迁移**：将剩余的源标签关联的 `id_tag` 更新为目标 ID
 
-> 代码参考：[TagDAO.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-FreshRSS/app/Models/TagDAO.php#L173-L202)
+> 代码参考：[app/Models/TagDAO.php](app/Models/TagDAO.php#L173-L202)
 
 ### 6.5 删除对 Feed 源标签无影响
 
@@ -341,15 +654,15 @@ public function deleteTag(int $id): int|false {
 
 - `getTagsForEntry($id_entry)` - 获取单篇文章的所有标签列表，并附带 `checked` 字段标识该文章是否已打此标签
 
-  位置：[TagDAO.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-FreshRSS/app/Models/TagDAO.php#L361-L384)
+  位置：[app/Models/TagDAO.php](app/Models/TagDAO.php#L361-L384)
 
 - `getTagsForEntries($entries)` - 批量获取多篇文章的标签，支持大数据量时分批查询（防止超过 SQL 最大参数数量）
 
-  位置：[TagDAO.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-FreshRSS/app/Models/TagDAO.php#L390-L429)
+  位置：[app/Models/TagDAO.php](app/Models/TagDAO.php#L390-L429)
 
 - `getEntryIdsTagNames($entries)` - 返回 `[e_{entryId} => [标签名1, 标签名2]]` 格式的关联数组，主要用于 API 和 JSON 导出
 
-  位置：[TagDAO.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-FreshRSS/app/Models/TagDAO.php#L437-L448)
+  位置：[app/Models/TagDAO.php](app/Models/TagDAO.php#L437-L448)
 
 ### 7.2 标签统计
 
@@ -363,7 +676,7 @@ public function deleteTag(int $id): int|false {
 - 通过 JOIN `_entrytag` 表实现按标签筛选文章列表
 - `markReadTag()` - 将指定标签下的文章批量标记为已读
 
-> 代码参考：[EntryDAO.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-FreshRSS/app/Models/EntryDAO.php#L750-L784)
+> 代码参考：[app/Models/EntryDAO.php](app/Models/EntryDAO.php#L750-L784)
 
 搜索查询中通过 `#标签名` 语法搜索标签时，会在 EntryDAO 中生成：
 
@@ -375,11 +688,11 @@ AND e.id IN (SELECT et.id_entry FROM _entrytag et WHERE et.id_tag IN (...))
 AND e.id IN (SELECT et.id_entry FROM _entrytag et, _tag t WHERE et.id_tag = t.id AND t.name IN (...))
 ```
 
-> 代码参考：[EntryDAO.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-FreshRSS/app/Models/EntryDAO.php#L1130-L1174)
+> 代码参考：[app/Models/EntryDAO.php](app/Models/EntryDAO.php#L1130-L1174)
 
 ### 7.4 全局标签缓存
 
-位置：[Context.php::labels()](file:///d:/fz/0601-1/solo-dogfeeding/code/25-FreshRSS/app/Models/Context.php#L217-L222)
+位置：[app/Models/Context.php](app/Models/Context.php#L217-L222)
 
 `FreshRSS_Context::labels()` 使用静态变量缓存标签列表，避免同一次请求内重复查询。
 
@@ -406,7 +719,7 @@ AND e.id IN (SELECT et.id_entry FROM _entrytag et, _tag t WHERE et.id_tag = t.id
 }
 ```
 
-> 代码参考：[tagController.php::updateAction()](file:///d:/fz/0601-1/solo-dogfeeding/code/25-FreshRSS/app/Controllers/tagController.php#L120-L123)
+> 代码参考：[app/Controllers/tagController.php](app/Controllers/tagController.php#L120-L123)
 
 ### 8.2 属性更新方法
 
@@ -415,9 +728,92 @@ AND e.id IN (SELECT et.id_entry FROM _entrytag et, _tag t WHERE et.id_tag = t.id
 
 ---
 
-## 九、总结
+## 九、Web UI 打标完整时序图
 
-### 9.1 关键设计特点
+```
+┌─────────────┐              ┌──────────────┐              ┌──────────────┐              ┌──────────────┐
+│   用户浏览器  │              │  main.js 前端 │              │ tagController │              │  TagDAO 后端  │
+└──────┬──────┘              └──────┬───────┘              └──────┬───────┘              └──────┬───────┘
+       │ 点击标签图标               │                            │                            │
+       │──────────────────────────>│                            │                            │
+       │                            │ 1. show_labels_menu()       │                            │
+       │                            │    判断是否需要重新加载      │                            │
+       │                            │ 2. loadDynamicTags()        │                            │
+       │                            │    GET getTagsForEntry      │                            │
+       │                            │───────────────────────────>│                            │
+       │                            │                            │ getTagsForEntryAction()    │
+       │                            │                            │───────────────────────────>│
+       │                            │                            │                            │ SELECT LEFT JOIN _tag _entrytag
+       │                            │                            │                            │ 返回 [{id,name,checked}]
+       │                            │                            │<───────────────────────────│
+       │                            │<───────────────────────────│                            │
+       │                            │ 3. 渲染 checkbox 列表        │                            │
+       │                            │    构建 DOM                 │                            │
+       │ 看到标签列表               │<───────────────────────────│                            │
+       │<───────────────────────────│                            │                            │
+       │                            │                            │                            │
+       │ 勾选已有标签 #5             │                            │                            │
+       │──────────────────────────>│                            │                            │
+       │                            │ 4. stream.onchange 触发      │                            │
+       │                            │    解析 tagId=5, entryId=xxx │                            │
+       │                            │    POST tagEntry JSON Body   │                            │
+       │                            │    {_csrf,id_tag:5,         │                            │
+       │                            │     id_entry,checked:true}  │                            │
+       │                            │───────────────────────────>│                            │
+       │                            │                            │ tagEntryAction()           │
+       │                            │                            │───────────────────────────>│
+       │                            │                            │                            │ tagEntry(): INSERT IGNORE
+       │                            │                            │                            │ INTO _entrytag
+       │                            │                            │<───────────────────────────│
+       │                            │ 5. onload 回调              │                            │
+       │                            │    文章未读? → incUnreadsTag │                            │
+       │                            │    #t_5 data-unread +1       │                            │
+       │                            │ 6. onloadend 回调            │                            │
+       │                            │    移除其他重复下拉菜单 DOM   │                            │
+       │ 侧边栏标签 #5 未读数+1     │                            │                            │
+       │<───────────────────────────│                            │                            │
+       │                            │                            │                            │
+       │ 勾选"新建标签"输入"紧急"    │                            │                            │
+       │──────────────────────────>│                            │                            │
+       │                            │ 7. 解析 tagId=0,            │                            │
+       │                            │    name_tag="紧急"          │                            │
+       │                            │    POST tagEntry            │                            │
+       │                            │    {_csrf,id_tag:0,         │                            │
+       │                            │     name_tag:"紧急",...}    │                            │
+       │                            │───────────────────────────>│                            │
+       │                            │                            │ 8. searchByName("紧急")    │
+       │                            │                            │    不存在 → addTag()        │
+       │                            │                            │───────────────────────────>│
+       │                            │                            │                            │ INSERT _tag → 返回新ID=12
+       │                            │                            │<───────────────────────────│
+       │                            │                            │ 9. tagEntry(id=12,...)     │
+       │                            │                            │───────────────────────────>│
+       │                            │                            │                            │ INSERT _entrytag
+       │                            │                            │<───────────────────────────│
+       │                            │ 10. onloadend 回调          │                            │
+       │                            │     forceReloadLabelsList=true │                          │
+       │                            │     loadDynamicTags() → 刷新 │                            │
+       │                            │     → GET getTagsForEntry  │ │                            │
+       │                            │    （现在返回包含 id:12 的列表）│                            │
+       │ 菜单显示新标签"紧急"已勾选  │                            │                            │
+       │<───────────────────────────│                            │                            │
+       │                            │                            │                            │
+       │ 打开另一篇文章的标签菜单    │                            │                            │
+       │──────────────────────────>│                            │                            │
+       │                            │ 11. show_labels_menu()      │                            │
+       │                            │     检查 forceReloadLabelsList │                          │
+       │                            │     = true → 删除旧缓存     │                            │
+       │                            │     → 重新 loadDynamicTags  │                            │
+       │                            │     （包含新标签"紧急"）     │                            │
+       │ 看到新标签"紧急"            │                            │                            │
+       │<───────────────────────────│                            │                            │
+```
+
+---
+
+## 十、总结
+
+### 10.1 关键设计特点
 
 1. **双标签体系并存**：Feed 源标签（只读，存储在 `_entry.tags`）与用户自定义标签（可管理，`_tag` + `_entrytag` 关联表）独立运作
 2. **规范化多对多设计**：用户标签使用独立实体表 + 关联表，符合数据库第三范式，支持一篇文章多标签、一标签多文章
@@ -427,42 +823,45 @@ AND e.id IN (SELECT et.id_entry FROM _entrytag et, _tag t WHERE et.id_tag = t.id
 6. **过滤规则驱动自动打标**：标签可配置布尔搜索规则，新文章入库时自动匹配并打标
 7. **多数据库适配**：通过工厂模式 + DAO 继承，支持 MySQL/SQLite/PostgreSQL，差异仅在 SQL 方言细节
 8. **多操作入口**：Web UI、Controller 直接调用、GReader API 三种方式管理标签和打标
+9. **前端下拉菜单惰性加载 + 缓存**：首次打开才 AJAX 拉取，复用缓存；仅新建标签时触发全局强制刷新
+10. **未读数乐观回写**：AJAX 成功后直接更新 DOM 中 `data-unread` 属性，不等待页面刷新，保证用户体验流畅
 
-### 9.2 数据流向图
+### 10.2 数据流向图
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                        标签创建                                      │
-├─────────────────────────────────────────────────────────────────────┤
-│                                                                     │
-│  标签管理页 ──POST──→ tag/addAction ──→ addTag() ──→ _tag 表        │
-│                        ↑ 检查不与分类重名                            │
-│                                                                     │
-│  文章打标 ──POST──→ tag/tagEntryAction ──→ 已存在? ──否──→ addTag() │
-│                        │                                    ↓       │
-│                        └──是──→ tagEntry() ──────────────→ _entrytag│
-│                                                                     │
-│  GReader API ──→ edit-tag ──→ 解析 label/xxx ──→ 自动创建+批量打标  │
-│                                                                     │
-│  Feed 更新 ──→ commitNewEntries() ──→ applyLabelActions()           │
-│                        │                         │                  │
-│                        │                         └→ 过滤规则匹配    │
-│                        │                               ↓            │
-│                        └──────────────────────→ tagEntries() 批量打标│
-└─────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           标签创建                                          │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  标签管理页 ──POST──→ tag/addAction ──→ addTag() ──→ _tag 表                 │
+│                        ↑ 检查不与分类重名                                    │
+│                                                                             │
+│  文章打标 ──POST──→ tag/tagEntryAction ──→ id_tag==0? ──否──→ searchByName() │
+│                        │                              ↓（不存在）            │
+│                        │                           addTag() → _tag           │
+│                        └──是/否──→ tagEntry() ──────────────→ _entrytag      │
+│                                                                             │
+│  GReader API ──→ edit-tag ──→ 解析 label/xxx ──→ 自动创建+批量打标            │
+│                                                                             │
+│  Feed 更新 ──→ commitNewEntries() ──→ applyLabelActions()                   │
+│                        │                               │                    │
+│                        │                               └→ 过滤规则匹配       │
+│                        │                                     ↓               │
+│                        └──────────────────────────→ tagEntries() 批量打标    │
+└─────────────────────────────────────────────────────────────────────────────┘
 
-┌─────────────────────────────────────────────────────────────────────┐
-│                        标签删除                                      │
-├─────────────────────────────────────────────────────────────────────┤
-│                                                                     │
-│  tag/deleteAction ──→ deleteTag(id) ──→ DELETE FROM _tag            │
-│                                                │                     │
-│                                                └── DB 级联 ──→       │
-│                                                    DELETE FROM       │
-│                                                    _entrytag WHERE   │
-│                                                    id_tag = 被删ID   │
-│                                                                     │
-│  tag/renameAction(重名时) ──→ updateEntryTag(迁移关联)               │
-│                              └──→ deleteTag(删除源标签)              │
-└─────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        标签删除                                              │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  tag/deleteAction ──→ deleteTag(id) ──→ DELETE FROM _tag                    │
+│                                                │                             │
+│                                                └── DB 外键级联 ──→           │
+│                                                    DELETE FROM               │
+│                                                    _entrytag WHERE           │
+│                                                    id_tag = 被删ID           │
+│                                                                             │
+│  tag/renameAction(重名时) ──→ updateEntryTag(迁移关联)                      │
+│                              └──→ deleteTag(删除源标签)                      │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
