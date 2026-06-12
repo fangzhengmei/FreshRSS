@@ -421,7 +421,9 @@ if (empty($infos)) {
 | `Dark` | 暗色 |
 | `Dark-pink` | 暗色粉色 |
 | `Alternative-Dark` | 备选暗色 |
-| `base-theme` | 开发用基础主题 |
+| `base-theme` | 开发用基础主题（`name` 为空，不出现在选择列表中） |
+
+**注意**：[FreshRSS_Themes::get()](file:///d:/fz/0601-1/solo-dogfeeding/code/29-FreshRSS/app/Models/Themes.php#L25-L36) 通过 `trim($theme['name']) !== ''` 过滤掉了 `base-theme`（其 `name` 为空字符串），因此它不会出现在主题选择列表中，但 `load()` 仍可通过 `get_infos()` 直接加载。
 
 ### 4.4 主题配置文件 metadata.json
 
@@ -509,6 +511,8 @@ if (FreshRSS_Context::userConf()->darkMode !== 'no') {
 - 但 `layout.phtml` 仍输出 `<html lang="xx" xml:lang="xx">`
 - 浏览器/屏幕阅读器会认为页面语言是 `xx`，可能影响语音合成和字体回退
 
+**此问题在所有三种 HTML 输出布局中均存在**（layout.phtml、simple.phtml、contentSelectorPreview.phtml 均直接输出 `userConf()->language`），见第 6 节。
+
 **API 信息页特例**：`p/api/index.php` 中 `lang="en-GB"` 是硬编码的，与 `getLanguage()` 的结果无关。
 
 #### RTL 检测层
@@ -518,68 +522,100 @@ RTL 检测依赖翻译词条 `_t('gen.dir')`。无效语言回退到 `en` 翻译
 #### 结论：翻译加载一致，lang 属性不一致
 
 **翻译加载**：所有路径对无效语言的表现一致——回退到英文。
-**lang 属性**：layout.phtml 直接输出 `userConf()->language` 的原始无效值，与实际翻译语言不一致。这是一个潜在的无障碍访问问题。
+**lang 属性**：三个 HTML 布局直接输出 `userConf()->language` 的原始无效值，与实际翻译语言不一致。这是一个潜在的无障碍访问问题。
 
 ### 5.2 无效主题值
 
-**场景**：用户配置中 `theme` 被设为不存在的主题名（如 `'NonExistent'`），无论通过何种方式写入。
+**场景**：用户配置中 `theme` 被设为不存在的主题名（如 `'NonExistent'`），无论通过何种方式写入（例如主题被删除后配置仍保留旧值）。
 
-#### 样式加载层
+#### 已证实的现象
+
+以下结论通过阅读源码直接验证，确定性高。
+
+**1. CSS 文件加载回退到 Origine ✅ 已证实**
 
 [FreshRSS::loadStylesAndScripts()](file:///d:/fz/0601-1/solo-dogfeeding/code/29-FreshRSS/app/FreshRSS.php#L110-L149) 调用 `FreshRSS_Themes::load(userConf()->theme)`：
 
 ```
 FreshRSS_Themes::load('NonExistent')
-  → get_infos('NonExistent') 返回 false/空
-  → 回退到 FreshRSS_Themes::load('Origine')
-  → 返回 Origine 的元数据和文件列表
-  → 加载 Origine 的 CSS/JS
+  → get_infos('NonExistent') 返回 false
+  → 回退到 self::load('Origine')
+  → 返回 Origine 的元数据（id='Origine', files=['_frss.css','origine.css'], theme-color={...}）
+  → loadStylesAndScripts() 用 $theme['id']（='Origine'）拼接 CSS/JS 路径
+  → 页面正常加载 Origine 的样式和脚本
 ```
 
-✅ 页面样式回退到 Origine，视觉表现正常。
+**2. theme-color meta 标签回退到 Origine ✅ 已证实**
 
-#### theme-color meta 标签层
+回退后 `FreshRSS_View::appendThemeColors($theme['theme-color'])` 拿到 Origine 的 `{"dark": "#1f1f1f", "light": "#f0f0f0"}`，`metaThemeColor()` 输出正确。
 
-回退到 Origine 后，`theme-color` 使用 Origine 的 `{"dark": "#1f1f1f", "light": "#f0f0f0"}`。✅ 一致。
+**3. HTML class 输出无效值，与实际加载主题不一致 ✅ 已证实**
 
-#### HTML class 属性层
+三个 HTML 布局中：
 
-[layout.phtml L16](file:///d:/fz/0601-1/solo-dogfeeding/code/29-FreshRSS/app/layout/layout.phtml#L16)：
+- [layout.phtml L16](file:///d:/fz/0601-1/solo-dogfeeding/code/29-FreshRSS/app/layout/layout.phtml#L16)：`$class[] = 'theme_' . FreshRSS_Context::userConf()->theme;` → 输出 `theme_NonExistent`
+- [simple.phtml](file:///d:/fz/0601-1/solo-dogfeeding/code/29-FreshRSS/app/layout/simple.phtml)：**无 `theme_*` class**（即便主题有效也没有）
+- [contentSelectorPreview.phtml](file:///d:/fz/0601-1/solo-dogfeeding/code/29-FreshRSS/app/views/feed/contentSelectorPreview.phtml)：**无 `theme_*` class**（同 simple）
 
-```php
-$class[] = 'theme_' . FreshRSS_Context::userConf()->theme;
-```
+**4. 内置主题 CSS 完全不使用 `.theme_*` 选择器 ✅ 已证实**
 
-**问题**：class 直接输出 `userConf()->theme` 的原始值，**不做回退**。
+对全部 `p/themes/` 下的 `.css` 文件搜索 `.theme_[A-Za-z]` 选择器，**0 条匹配**。所有内置主题（Origine、Dark、Flat、Swage、Nord 等）的 CSS 中没有任何 `.theme_*` 前缀的选择器。`theme_*` class 纯粹是 HTML 元数据标识，**不影响任何内置主题的视觉表现**。
 
-| 实际加载的主题 CSS | HTML class | 是否一致 |
-|------------------|-----------|---------|
-| Origine（回退） | `theme_NonExistent` | ❌ 不一致 |
+**5. darkMode_auto 选择器不受影响 ✅ 已证实**
 
-**影响**：
-- CSS 中以 `.theme_Origine` 为选择器的样式不会生效（class 名不匹配）
-- 页面可能缺少主题特定的 CSS 覆盖，导致样式不完整
-- 依赖 `theme_*` class 的自定义 CSS 或 JavaScript 也会失效
+Origine 的 `origine.css` 中有 24 处 `:root.darkMode_auto` 选择器（L1239、L1327-L1358 等），暗色模式样式依赖 `darkMode_auto` class，与 `theme_*` class 无关，不受无效主题值影响。
 
-#### 结论：样式部分回退但不完整
+**6. 设置页显示 `theme_not_available` 提示 ✅ 已证实**
 
-**CSS 文件加载**：回退到 Origine 的文件列表，基础样式正常。
-**CSS class 选择器**：`theme_NonExistent` 与实际加载的 Origine CSS 不匹配，主题特有样式可能丢失。
-**根因**：`loadStylesAndScripts()` 和 `layout.phtml` 对主题回退的处理不一致——前者使用了回退后的主题，后者仍使用配置中的原始值。
+[display.phtml L86-L93](file:///d:/fz/0601-1/solo-dogfeeding/code/29-FreshRSS/app/views/configure/display.phtml#L86-L93)：当遍历所有可用主题后仍找不到当前配置的主题时（`$themeAvailable = false`），显示红色错误提示 `theme_not_available`，告知用户选择其他主题。这给了用户修正的入口。
+
+**7. load() 返回 false 时完全不加载主题 CSS ✅ 已证实**
+
+若 `load()` 连 Origine 和第一个可用主题都无法加载（极端情况），返回 `false`，则 `loadStylesAndScripts()` 中 `if (is_array($theme))` 不成立，**不会加载任何主题 CSS/JS**，仅加载 `main.js` 和 `extra.js`。页面将完全没有样式。
+
+#### 仍需谨慎判断的影响
+
+以下推断基于代码分析，但涉及代码库外部或未来因素，无法在当前代码中严格证实或证伪。
+
+**1. 第三方自定义主题可能依赖 `.theme_*` 选择器 ⚠️**
+
+若第三方主题在其 CSS 中使用 `.theme_{id}` 选择器（如 `.theme_MyCustomTheme .header { ... }`），则无效主题时 class 不匹配会导致这些样式规则不生效。但当前代码库中无法验证这一点——已确认的是所有内置主题均不使用该选择器，FreshRSS 的主题开发文档也未要求使用此 class。
+
+**2. 浏览器扩展 / 用户脚本可能读取 `theme_*` class ⚠️**
+
+用户脚本可能通过 `document.documentElement.classList.contains('theme_Origine')` 判断主题并注入自定义 CSS。无效主题时会误判。这属于代码库外逻辑，无法验证。
+
+**3. `simple.phtml` 和 `contentSelectorPreview.phtml` 本身就缺少 `theme_*` class ⚠️**
+
+这是一个独立于无效主题值的问题：即便主题有效，简版布局和预览页也不输出 `theme_*` class。若第三方主题依赖此 class，在这两个页面同样会样式缺失。该问题**与无效主题值无关**，但影响面重合。
+
+**4. 未来版本可能引入基于 `theme_*` 的样式架构 ⚠️**
+
+若后续版本改为通过 `.theme_*` 选择器实现主题差异化（类似当前 `:root.darkMode_auto` 的做法），则 class 不一致将演变为实际 Bug。但这是对代码演进的预测，非当前事实。
+
+**5. `theme_*` class 用于辅助技术的可能性 ⚠️**
+
+辅助技术一般不读取非标准 class，HTML 规范也未将此类 class 用于无障碍目的。但不能排除某些定制工具使用它。影响极小但无法绝对排除。
+
+#### 无效主题值表现总结
+
+| 方面 | 状态 | 说明 |
+|------|------|------|
+| CSS 文件加载 | ✅ 已证实回退到 Origine | 视觉正常 |
+| `theme-color` meta | ✅ 已证实回退到 Origine | 浏览器 UI 色正常 |
+| `darkMode_auto` 暗色模式 | ✅ 已证实正常工作 | 使用 `:root.darkMode_auto` 选择器，不受 theme class 影响 |
+| 内置主题视觉表现 | ✅ 已证实无影响 | 所有内置主题 CSS 不使用 `.theme_*` 选择器 |
+| 设置页提示 | ✅ 已证实显示错误提示 | 用户可修正 |
+| HTML `theme_*` class | ✅ 已证实为无效值 | 与实际加载的 Origine 不一致，但当前不影响样式 |
+| 第三方自定义主题 CSS | ⚠️ 需谨慎判断 | 可能受影响（取决于是否使用 `.theme_*` 选择器） |
+| 简版/预览布局的 theme class 缺失 | ⚠️ 需谨慎判断 | 与无效主题值无关，但第三方主题同样受此影响 |
+| load() 返回 false | ✅ 已证实无 CSS | 极端情况，页面无样式 |
 
 ### 5.3 无效 darkMode 值
 
-`darkMode` 没有验证和回退逻辑。若设为任意字符串（如 `'foobar'`），layout.phtml 会输出 `darkMode_foobar` 作为 class。没有对应 CSS 规则，效果等同于 `darkMode_auto` 的缺失——即不触发任何暗色模式 CSS。
+`darkMode` 没有验证和回退逻辑。若设为任意字符串（如 `'foobar'`），三个 HTML 布局均输出 `darkMode_foobar` 作为 class。Origine 主题中只有 `:root.darkMode_auto` 选择器，`darkMode_foobar` 不匹配任何规则，效果等同于不触发暗色模式 CSS。这不是回退，而是**静默失效**。
 
-### 5.4 无效值场景汇总
-
-| 配置项 | 翻译/样式是否回退 | DOM 属性是否回退 | 两者是否一致 |
-|--------|-----------------|----------------|------------|
-| `language`（无效值） | ✅ 回退到 `en` 翻译 | ❌ `lang` 属性仍为无效值 | ❌ 不一致 |
-| `theme`（无效值） | ✅ CSS 文件回退到 Origine | ❌ class 仍为 `theme_{无效值}` | ❌ 不一致 |
-| `darkMode`（无效值） | N/A（无回退逻辑） | ❌ class 为 `darkMode_{无效值}` | N/A（无验证机制） |
-
-### 5.5 无效值如何产生
+### 5.4 无效值如何产生
 
 正常 Web UI 操作不会写入无效值，因为：
 
@@ -598,71 +634,295 @@ $class[] = 'theme_' . FreshRSS_Context::userConf()->theme;
 
 ## 6. 页面渲染生效路径
 
-### 6.1 完整请求生命周期
+### 6.1 渲染管线总览
+
+所有 HTML 页面请求经历相同的初始化阶段，分歧点在 Controller action 中对 `_layout()` 的调用：
 
 ```
-HTTP 请求
+HTTP 请求 → p/i/index.php
   ↓
-p/i/index.php（入口）
+FreshRSS::init()                     ← 所有页面共用
+  ├─ FreshRSS_Context::initSystem()  ← 加载系统配置
+  ├─ FreshRSS_Auth::init()           ← 认证（可能触发 HTTP 认证自动建号）
+  ├─ FreshRSS_Context::initUser()    ← 加载当前用户配置（语言、主题、darkMode）
+  └─ FreshRSS::initI18n()            ← 确定语言，加载翻译
   ↓
-FreshRSS->init()                         ← 初始化系统配置、用户配置、i18n
-  ├─ FreshRSS_Context::initSystem()      ← 加载 data/config.php
-  ├─ FreshRSS_Context::initUser()        ← 加载 data/users/{user}/config.php
-  └─ FreshRSS::initI18n()                ← 确定语言，加载翻译
+Minz_Dispatcher::run()
+  ├─ Controller->firstAction()
+  ├─ Controller->{action}Action()    ← 业务逻辑 + _layout() 决定布局
+  └─ Controller->lastAction()
   ↓
-Minz_FrontController->run()
-  ↓
-Controller->firstAction()
-Controller->{action}Action()             ← 业务逻辑
-  ↓
-layout.phtml（布局渲染）
-  ├─ FreshRSS::preLayout()               ← 加载样式和脚本
-  │   └─ FreshRSS::loadStylesAndScripts() ← 根据 userConf()->theme 加载 CSS/JS
-  ├─ <html lang="userConf()->language">  ← 语言写入 HTML lang 属性
-  ├─ class="theme_{userConf()->theme}"   ← 主题名写入 HTML class
-  ├─ class="darkMode_{userConf()->darkMode}" ← 暗色模式 class
-  ├─ FreshRSS_View::metaThemeColor()     ← 主题色 meta 标签
-  ├─ FreshRSS_View::headStyle()          ← 输出 <link> 标签
-  └─ FreshRSS_View::headScript()         ← 输出 <script> 标签
+Minz_View::build()                   ← 根据布局文件名选择渲染路径
+  │
+  ├─ layout_filename !== '' → buildLayout()  ← 有布局
+  │   ├─ 'layout'  → layout.phtml           ← 主布局
+  │   └─ 'simple'  → simple.phtml           ← 简版布局
+  │
+  └─ layout_filename === '' → render()       ← 无布局（裸输出视图模板）
+      ├─ 大部分：HTML 片段（Ajax 响应）
+      └─ 特例：contentSelectorPreview.phtml（自包含 HTML 文档）
 ```
 
-### 6.2 主题生效的关键代码
+### 6.2 主布局（layout.phtml）— 默认路径
 
-[FreshRSS::loadStylesAndScripts()](file:///d:/fz/0601-1/solo-dogfeeding/code/29-FreshRSS/app/FreshRSS.php#L110-L149)：
+**适用范围**：绝大多数页面，包括：
+- 主阅读页（index/index）
+- 所有设置页（configure/display、configure/reading、configure/archiving 等）
+- 订阅管理页（subscription/feed、subscription/add 等）
+- 用户资料页（user/profile，邮箱已验证时）
+- 标签管理页
+- 扩展管理页
+- 日志页
+- 关于页
 
-1. 调用 `FreshRSS_Themes::load(FreshRSS_Context::userConf()->theme)` 获取主题元数据
-2. 按逆序遍历 `theme['files']`，通过 `FreshRSS_View::prependStyle()` 注入 CSS
-3. `_` 前缀文件从 `base-theme` 目录加载，其余从主题自身目录加载
-4. RTL 语言时自动替换为 `.rtl.css` 版本
-5. 附加 `theme-color` meta 标签
+**触发条件**：Controller action 中**未调用** `_layout()`，或调用了 `$this->view->_layout('layout')`。
 
-[layout.phtml](file:///d:/fz/0601-1/solo-dogfeeding/code/29-FreshRSS/app/layout/layout.phtml#L16-L19) 中将主题和暗色模式写入 HTML class：
+**渲染流程**：
+
+```
+[ layout.phtml ]
+  │
+  ├─ FreshRSS::preLayout()
+  │   └─ loadStylesAndScripts()
+  │       └─ FreshRSS_Themes::load(userConf()->theme) → 加载回退后的主题 CSS/JS
+  │       └─ FreshRSS_View::appendThemeColors()       → 主题色
+  │
+  ├─ <html> 元素属性与 class：
+  │   ├─ lang="userConf()->language"                   ← 直接取配置值
+  │   ├─ xml:lang="userConf()->language"               ← 直接取配置值
+  │   ├─ dir="rtl"                                     ← RTL 语言时
+  │   ├─ class="controller_{name}"                     ← 当前 controller 名
+  │   ├─ class="theme_{userConf()->theme}"             ← ⚠️ 直接取配置值，不做回退
+  │   ├─ class="darkMode_{userConf()->darkMode}"       ← darkMode !== 'no' 时
+  │   ├─ class="rtl"                                   ← RTL 语言时
+  │   └─ class="logged_in"                             ← 已登录时
+  │
+  ├─ <head> 内容：
+  │   ├─ FreshRSS_View::metaThemeColor()               ← 主题色 meta（已回退）
+  │   ├─ FreshRSS_View::headStyle()                    ← CSS <link>（已回退）
+  │   ├─ renderHelper('javascript_vars')               ← JS 配置变量
+  │   ├─ FreshRSS_View::headScript()                   ← JS <script>（含 main.js、extra.js）
+  │   ├─ <link rel="manifest">、favicon、apple-touch-icon
+  │   ├─ FreshRSS_View::headTitle()
+  │   └─ RSS/OPML <link>、robots meta
+  │
+  ├─ <body class="{actionName}">
+  │   ├─ partial('header')                             ← 顶部导航栏
+  │   ├─ <div id="global">
+  │   │   ├─ aside_feed / aside_configure / aside_subscription  ← 侧边栏
+  │   │   └─ $this->render()                           ← 视图内容
+  │   └─ <div id="notification">                       ← 通知提示
+  │
+  └─ </html>
+```
+
+**关键观察**：
+- `theme_*` class 取 `userConf()->theme` **原始值**（可能无效），而 CSS 文件加载取 `load()` **回退后的值**
+- `lang` 属性取 `userConf()->language` **原始值**（可能无效），而翻译文本取 `initI18n()` **回退后的值**
+- 这是无效值时 DOM 属性与实际渲染不一致的根因
+
+### 6.3 简版布局（simple.phtml）
+
+**适用范围**：
+
+| Controller | Action | 触发条件 | 代码位置 |
+|-----------|--------|---------|---------|
+| userController | `profileAction()` | 邮箱未验证时（`email_validation_token != ''`） | [userController.php L160](file:///d:/fz/0601-1/solo-dogfeeding/code/29-FreshRSS/app/Controllers/userController.php#L160) |
+| userController | `validateEmailAction()` | 始终使用 simple 布局 | [userController.php L577](file:///d:/fz/0601-1/solo-dogfeeding/code/29-FreshRSS/app/Controllers/userController.php#L577) |
+
+**触发条件**：Controller action 中调用 `$this->view->_layout('simple')`。
+
+**渲染流程**：
+
+```
+[ simple.phtml ]
+  │
+  ├─ FreshRSS::preLayout()                            ← 与主布局完全相同
+  │   └─ loadStylesAndScripts() → 同上
+  │
+  ├─ <html> 元素属性与 class：
+  │   ├─ lang="userConf()->language"                   ← 与主布局相同
+  │   ├─ xml:lang="userConf()->language"               ← 与主布局相同
+  │   ├─ dir="rtl"                                     ← RTL 语言时
+  │   ├─ class="rtl"                                   ← RTL 语言时（注意：拼接在字符串前部）
+  │   ├─ class="darkMode_{userConf()->darkMode}"       ← 与主布局相同
+  │   └─ ❌ 无 theme_* class                          ← 与主布局不同
+  │
+  ├─ <head> 内容：
+  │   ├─ FreshRSS_View::metaThemeColor()               ← 与主布局相同
+  │   ├─ FreshRSS_View::headStyle()                    ← 与主布局相同
+  │   ├─ renderHelper('javascript_vars')               ← 与主布局相同
+  │   ├─ FreshRSS_View::headScript()                   ← 与主布局相同
+  │   ├─ <link rel="manifest">、favicon、apple-touch-icon
+  │   ├─ FreshRSS_View::headTitle()
+  │   └─ robots meta（始终 noindex,nofollow）
+  │
+  ├─ <body>
+  │   ├─ 精简 header（仅 logo + 登录/登出按钮）
+  │   ├─ <div class="app-layout app-layout-simple">
+  │   │   └─ $this->render()                           ← 视图内容
+  │   └─ <div id="notification">                       ← 与主布局相同
+  │
+  └─ </html>
+```
+
+**与主布局的差异（主题/语言维度）**：
+
+| 项目 | layout.phtml | simple.phtml | 一致性 |
+|------|-------------|--------------|--------|
+| `lang` / `xml:lang` | `userConf()->language` | `userConf()->language` | ✅ |
+| `darkMode_*` class | 有 | 有 | ✅ |
+| `rtl` class + `dir` | 有 | 有 | ✅ |
+| `theme_*` class | `theme_{userConf()->theme}` | **无** | ❌ |
+| `preLayout()` / CSS | 有 | 有 | ✅ |
+| `metaThemeColor()` | 有 | 有 | ✅ |
+| `headScript()` | 完整 | 完整 | ✅ |
+| 侧边栏 | 有 | 无 | —（功能差异） |
+| 导航栏 | 完整 header.phtml | 仅 logo + 登录/登出 | —（功能差异） |
+
+**`theme_*` class 缺失的影响**：已证实所有内置主题 CSS 不使用 `.theme_*` 选择器，因此对内置主题无视觉影响。若第三方主题依赖此 class，则简版布局中该主题的特有样式会缺失。
+
+### 6.4 内容选择器预览页（contentSelectorPreview.phtml）
+
+**适用范围**：
+
+| Controller | Action | 触发条件 | 代码位置 |
+|-----------|--------|---------|---------|
+| feedController | `contentSelectorPreviewAction()` | 在 feed 配置页点击 CSS 路径旁的「预览」按钮 | [feedController.php L1274](file:///d:/fz/0601-1/solo-dogfeeding/code/29-FreshRSS/app/Controllers/feedController.php#L1274) |
+
+**实现方式**：
+1. Controller：`$this->view->_layout(null)` — 禁用布局
+2. 视图模板自身包含完整 HTML 文档结构（`<html>`、`<head>`、`<body>`）
+
+**渲染流程**：
+
+```
+[ contentSelectorPreview.phtml ] 自包含 HTML 文档
+  │
+  ├─ FreshRSS::preLayout()                            ← 与主布局完全相同
+  │   └─ loadStylesAndScripts() → 同上
+  │
+  ├─ <html> 元素属性与 class：
+  │   ├─ lang="userConf()->language"                   ← 与主布局相同
+  │   ├─ xml:lang="userConf()->language"               ← 与主布局相同
+  │   ├─ dir="rtl"                                     ← RTL 语言时
+  │   ├─ class="preview_background"                    ← 预览专用 class
+  │   ├─ class="rtl"                                   ← RTL 语言时
+  │   ├─ class="darkMode_{userConf()->darkMode}"       ← 与主布局相同
+  │   └─ ❌ 无 theme_* class                          ← 与主布局不同
+  │
+  ├─ <head> 内容：
+  │   ├─ ❌ 无 metaThemeColor()                       ← 与主布局不同
+  │   ├─ FreshRSS_View::headStyle()                    ← CSS <link>（已回退）
+  │   └─ 仅 preview.js（无 headScript() 的 main.js/extra.js）
+  │
+  ├─ <body class="preview_background">
+  │   ├─ 错误提示 / 预览内容（rendered/raw 切换）
+  │   └─ 使用翻译函数 _t()
+  │
+  └─ </html>
+```
+
+**与主布局的差异（主题/语言维度）**：
+
+| 项目 | layout.phtml | contentSelectorPreview.phtml | 一致性 |
+|------|-------------|------------------------------|--------|
+| `lang` / `xml:lang` | `userConf()->language` | `userConf()->language` | ✅ |
+| `darkMode_*` class | 有 | 有 | ✅ |
+| `rtl` class + `dir` | 有 | 有 | ✅ |
+| `theme_*` class | `theme_{userConf()->theme}` | **无** | ❌ |
+| `preLayout()` / CSS | 有 | 有 | ✅ |
+| `metaThemeColor()` | 有 | **无** | ❌ |
+| `headScript()` | main.js + extra.js | 仅 `preview.js` | ❌ |
+| `controller_*` class | 有 | **无** | —（功能性） |
+
+**预览页特殊性**：
+- 这是一个嵌入在 iframe 中的预览页面，由 CSP 头限制了 `frame-ancestors: 'self'`
+- 缺少 `metaThemeColor()` 和完整的 JS 脚本对预览功能本身没有影响
+- 但缺少 `theme_*` class 与 simple.phtml 同理，若第三方主题依赖此 class 则样式缺失
+
+### 6.5 设置页（configure/）
+
+**适用范围**：所有 `/configure/*` 路由：
+
+| Action | 视图模板 | 说明 |
+|--------|---------|------|
+| `display` | [configure/display.phtml](file:///d:/fz/0601-1/solo-dogfeeding/code/29-FreshRSS/app/views/configure/display.phtml) | 显示配置（语言、主题、darkMode） |
+| `reading` | configure/reading.phtml | 阅读配置 |
+| `archiving` | configure/archiving.phtml | 归档配置 |
+| `integration` | configure/integration.phtml | 分享/集成配置 |
+| `shortcut` | configure/shortcut.phtml | 快捷键配置 |
+| `queries` / `query` | configure/queries.phtml / query.phtml | 自定义查询配置 |
+| `privacy` | configure/privacy.phtml | 隐私配置 |
+| `system` | configure/system.phtml | 系统配置（管理员） |
+
+**布局**：使用默认 `layout.phtml`，**无任何 configure action 调用 `_layout()`**。
+
+**唯一特例**：`queryAction()` 在 `ajax=1` 时调用 `_layout(null)`，仅返回查询配置的 HTML 片段。
+
+**渲染流程**：与第 6.2 节主布局完全相同。侧边栏使用 [aside_configure.phtml](file:///d:/fz/0601-1/solo-dogfeeding/code/29-FreshRSS/app/layout/aside_configure.phtml)，提供设置页导航菜单。
+
+**主题/语言配置保存**：`displayAction()` 是唯一的保存入口，见第 2.3 节和第 4.6 节。
+
+**无效主题的提示**：当配置的主题不可用时，[display.phtml L86-L93](file:///d:/fz/0601-1/solo-dogfeeding/code/29-FreshRSS/app/views/configure/display.phtml#L86-L93) 在主题预览列表末尾显示红色错误提示：
 
 ```php
-$class[] = 'theme_' . FreshRSS_Context::userConf()->theme;          // 如 theme_Origine
-if (FreshRSS_Context::userConf()->darkMode !== 'no') {
-    $class[] = 'darkMode_' . FreshRSS_Context::userConf()->darkMode; // 如 darkMode_auto
-}
+<?php if (!$themeAvailable) {?>
+    <li class="preview-container picked">
+        <div class="preview"></div>
+        <div class="properties alert-error">
+            <div><?= _t('conf.display.theme_not_available', FreshRSS_Context::userConf()->theme)?></div>
+        </div>
+    </li>
+<?php }?>
 ```
 
-### 6.3 语言生效的关键代码
+`$themeAvailable` 在遍历可用主题列表时判断：若某个主题的 `$theme['id']` 与 `userConf()->theme` 相等，则设为 `true`。否则保持初始值 `false`，显示提示。
 
-[layout.phtml](file:///d:/fz/0601-1/solo-dogfeeding/code/29-FreshRSS/app/layout/layout.phtml#L28) 中语言写入 HTML 属性：
+### 6.6 无布局页面（_layout(null)）
 
-```php
-<html lang="<?= FreshRSS_Context::userConf()->language ?>"
-      xml:lang="<?= FreshRSS_Context::userConf()->language ?>">
-```
+**适用范围**：Ajax 请求、数据导出、JS 配置等。这些页面**不输出完整 HTML 文档**，无需关心 `lang`/`theme_*` class。
 
-翻译文本通过 `_t('key.subkey')` 函数在所有 .phtml 视图模板中使用，该函数是 `Minz_Translate::t()` 的别名。
+| Controller | Action | 触发条件 | 输出内容 |
+|-----------|--------|---------|---------|
+| entryController | 所有 action | `ajax=1` 时 | HTML 片段 |
+| feedController | `actualizeAction` | `ajax=1` 时 | HTML 片段 |
+| feedController | `contentSelectorPreviewAction` | 始终 | 自包含 HTML 文档（见 6.4） |
+| categoryController | 多个 action | `ajax=1` 时 | HTML 片段 |
+| subscriptionController | `feedAction` | `ajax=1` 时 | HTML 片段 |
+| tagController | 多个 action | `ajax=1` 时 | HTML 片段 |
+| extensionController | 多个 action | `ajax=1` 时 | HTML 片段 |
+| importExportController | 多个 action | 始终 | JSON/文件 |
+| javascriptController | `nonceAction` | 始终 | JS |
+| indexController | `rssAction` | 始终 | RSS XML |
+| indexController | `opmlAction` | 始终 | OPML XML |
+| userController | `deleteAction` | 始终 | HTML 片段 |
+| configureController | `queryAction` | `ajax=1` 时 | HTML 片段 |
 
-### 6.4 RTL 支持
+**注意**：Ajax HTML 片段会被插入主页面 DOM，此时使用的 CSS/JS 和 `lang`/class 均来自主布局。片段本身不需要独立处理主题和语言。
 
-语言为 RTL（如 `he` 希伯来语）时，翻译词条 `gen.dir` 返回 `'rtl'`，layout.phtml 会：
+### 6.7 三种 HTML 布局的主题/语言表现对比
 
-- 在 `<html>` 添加 `dir="rtl"` 属性
-- 在 HTML class 中添加 `rtl`
-- CSS 文件自动替换为 `.rtl.css` 版本
+| 维度 | layout.phtml（默认） | simple.phtml | contentSelectorPreview.phtml | 无布局（Ajax/RSS/JSON） |
+|------|---------------------|-------------|-----------------------------|----------------------|
+| `<html lang>` | `userConf()->language` | `userConf()->language` | `userConf()->language` | N/A（无 HTML 文档） |
+| `<html xml:lang>` | `userConf()->language` | `userConf()->language` | `userConf()->language` | N/A |
+| `dir="rtl"` | RTL 语言时 | RTL 语言时 | RTL 语言时 | N/A |
+| `rtl` class | RTL 语言时 | RTL 语言时 | RTL 语言时 | N/A |
+| `theme_*` class | ✅ `theme_{theme}` | ❌ **无** | ❌ **无** | N/A |
+| `darkMode_*` class | ✅ `darkMode_{value}` | ✅ `darkMode_{value}` | ✅ `darkMode_{value}` | N/A |
+| `controller_*` class | ✅ `controller_{name}` | ❌ 无 | ❌ 无 | N/A |
+| `preview_background` class | ❌ 无 | ❌ 无 | ✅ 有 | N/A |
+| `metaThemeColor()` | ✅ 有 | ✅ 有 | ❌ **无** | N/A |
+| `preLayout()` / CSS | ✅ 完整 | ✅ 完整 | ✅ 完整 | N/A |
+| `headScript()` | ✅ 完整 | ✅ 完整 | ❌ 仅 `preview.js` | N/A |
+| 翻译 `_t()` | ✅ 可用 | ✅ 可用 | ✅ 可用 | ✅ 可用（数据导出也用） |
+
+**一致性总结**：
+- `lang` / `darkMode_*` / `rtl`：三种布局**一致**
+- `theme_*` class：仅 layout.phtml 输出，simple 和 preview **缺失**（但已证实不影响内置主题视觉）
+- `metaThemeColor()`：仅 preview 缺失（对 iframe 预览无实际影响）
+- `headScript()`：preview 仅加载 `preview.js`（预览页不需要主脚本）
 
 ---
 
@@ -690,12 +950,18 @@ if (FreshRSS_Context::userConf()->darkMode !== 'no') {
 | [FreshRSS.php](file:///d:/fz/0601-1/solo-dogfeeding/code/29-FreshRSS/app/FreshRSS.php) | 前端控制器，初始化 i18n 和加载样式/脚本 |
 | [Translate.php](file:///d:/fz/0601-1/solo-dogfeeding/code/29-FreshRSS/lib/Minz/Translate.php) | 翻译引擎，语言选择与翻译加载 |
 | [Themes.php](file:///d:/fz/0601-1/solo-dogfeeding/code/29-FreshRSS/app/Models/Themes.php) | 主题管理，加载与回退 |
-| [Minz/View.php](file:///d:/fz/0601-1/solo-dogfeeding/code/29-FreshRSS/lib/Minz/View.php) | 视图基类，管理 styles/scripts/themeColors |
-| [layout.phtml](file:///d:/fz/0601-1/solo-dogfeeding/code/29-FreshRSS/app/layout/layout.phtml) | HTML 布局模板，主题和语言写入 DOM |
+| [Minz/View.php](file:///d:/fz/0601-1/solo-dogfeeding/code/29-FreshRSS/lib/Minz/View.php) | 视图基类，管理 styles/scripts/themeColors，build() 分发布局 |
+| [Minz/Dispatcher.php](file:///d:/fz/0601-1/solo-dogfeeding/code/29-FreshRSS/lib/Minz/Dispatcher.php) | 调度器，调用 controller → view.build() |
+| [layout.phtml](file:///d:/fz/0601-1/solo-dogfeeding/code/29-FreshRSS/app/layout/layout.phtml) | 主布局模板，完整 DOM（theme class + lang + darkMode） |
+| [simple.phtml](file:///d:/fz/0601-1/solo-dogfeeding/code/29-FreshRSS/app/layout/simple.phtml) | 简版布局模板，精简 DOM（无 theme class） |
+| [contentSelectorPreview.phtml](file:///d:/fz/0601-1/solo-dogfeeding/code/29-FreshRSS/app/views/feed/contentSelectorPreview.phtml) | 预览页自包含 HTML（无 theme class + 无 metaThemeColor） |
+| [aside_configure.phtml](file:///d:/fz/0601-1/solo-dogfeeding/code/29-FreshRSS/app/layout/aside_configure.phtml) | 设置页侧边栏导航 |
 | [configureController.php](file:///d:/fz/0601-1/solo-dogfeeding/code/29-FreshRSS/app/Controllers/configureController.php) | 显示配置页控制器，保存主题/语言/暗色模式 |
+| [display.phtml](file:///d:/fz/0601-1/solo-dogfeeding/code/29-FreshRSS/app/views/configure/display.phtml) | 显示配置页视图，含 theme_not_available 提示 |
 | [Auth.php](file:///d:/fz/0601-1/solo-dogfeeding/code/29-FreshRSS/app/Models/Auth.php) | 认证系统，含 HTTP 认证自动建号的语言处理 |
 | [authController.php](file:///d:/fz/0601-1/solo-dogfeeding/code/29-FreshRSS/app/Controllers/authController.php) | 登录/注册控制器 |
 | [userController.php](file:///d:/fz/0601-1/solo-dogfeeding/code/29-FreshRSS/app/Controllers/userController.php) | 用户管理控制器，含 createUser 建号逻辑 |
+| [feedController.php](file:///d:/fz/0601-1/solo-dogfeeding/code/29-FreshRSS/app/Controllers/feedController.php) | Feed 控制器，含 contentSelectorPreviewAction |
 | [p/api/index.php](file:///d:/fz/0601-1/solo-dogfeeding/code/29-FreshRSS/p/api/index.php) | API 信息页 |
 | [p/api/greader.php](file:///d:/fz/0601-1/solo-dogfeeding/code/29-FreshRSS/p/api/greader.php) | Google Reader 兼容 API |
 | [p/api/fever.php](file:///d:/fz/0601-1/solo-dogfeeding/code/29-FreshRSS/p/api/fever.php) | Fever 兼容 API |
