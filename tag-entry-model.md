@@ -412,79 +412,129 @@ req.onloadend = function (e) {
 };
 ```
 
-### 5.2 新增标签后为什么要强制刷新列表？
+### 5.2 新增标签后的刷新策略与 `forceReloadLabelsList`
 
 **全局变量定义**（[p/scripts/main.js](p/scripts/main.js#L1691-L1694)）：
 
 ```js
-// forceReloadLabelsList 默认值为 false，第二次及以后打开菜单时不需要重新加载
-// 当添加新标签时将被设置为 true，之后每次打开标签菜单都会重新拉取
-// 目的：最小化网络请求流量
+// forceReloadLabelsList default is false, so that the list does need a reload after opening it a second time.
+// will be set to true, if a new tag is added. Then the labels list will be reloaded each opening.
+// purpose of this flag: minimize the network traffic.
 let forceReloadLabelsList = false;
 ```
 
-#### 强制刷新的触发时机
+#### 代码中仅有的 3 个引用点
+
+| 位置 | 代码 | 作用 |
+|------|------|------|
+| L1694 | `let forceReloadLabelsList = false;` | **声明并初始化**为 `false` |
+| L1623 | `forceReloadLabelsList = true;` | **唯一置位点**：新建标签后设置为 `true` |
+| L784 | `if (!dropdownMenu \|\| forceReloadLabelsList)` | **唯一消费点**：`show_labels_menu()` 中判断是否重建菜单 |
+
+> ⚠️ **关键事实：代码中没有任何地方将 `forceReloadLabelsList` 重置回 `false`**。一旦被置为 `true`，它在当前页面的整个生命周期内将永远保持 `true`。
+
+#### 从置位到消费的完整路径
 
 ```
-用户勾选"新建标签"复选框 → tagId=0
+① 用户勾选"新建标签"(tagId=0)，输入标签名后提交
     ↓
-onloadend 回调中：
-    forceReloadLabelsList = true          // 设置全局标志
-    loadDynamicTags(当前dropdown)         // 立即刷新当前文章的菜单
-```
-
-#### 为什么需要强制刷新？三个原因
-
-| 原因 | 说明 |
-|------|------|
-| **1. 新标签需要出现在所有文章的菜单中** | 新标签被创建后，它应该出现在**所有文章**的标签下拉菜单里，而不只是当前这篇。如果不刷新，其他文章的菜单还是旧的缓存列表，用户找不到新标签。 |
-| **2. 新标签 ID 从 0 变为实际 ID** | 新建时 `tagId=0` 是临时占位，数据库插入后返回实际 ID。下次打同一个标签时必须用真实 ID，否则会重复创建。只有重新拉取才能拿到正确的 `id:数字` 数据。 |
-| **3. 所有文章的 `checked` 状态可能变化** | 新建标签后，当前文章已打了这个标签（`checked=true`），其他文章没有。只有重新查询 `getTagsForEntry` 才能反映出正确的勾选状态。 |
-
-#### `show_labels_menu()` 中的检查逻辑
-
-```js
-async function show_labels_menu(el) {
-    const div = el.parentElement;
+② XHR POST ./?c=tag&a=tagEntry&ajax=1 请求成功
+    ↓
+③ req.onloadend 回调（L1619-1641）：
+    if (tagId == 0) {
+        forceReloadLabelsList = true;                           // ← 唯一置位点
+        loadDynamicTags(checkboxTag.closest('div.dropdown'));   // 立即刷新当前文章的菜单
+    }
+    ↓
+④ 立即触发的 loadDynamicTags()：
+    - 每次调用都无条件发送 GET ./?c=tag&a=getTagsForEntry&id_entry={entryId}
+    - 没有任何客户端缓存层，每次都是全新的 AJAX 请求
+    ↓
+⑤ 后续用户打开**任意**文章的标签菜单：
+    调用 show_labels_menu(el)
+    ↓
+⑥ show_labels_menu 的判断逻辑（L780-797）：
     const dropdownMenu = div.querySelector('.dropdown-menu');
 
-    // ★ 核心判断：菜单不存在 OR 强制刷新标志为true
     if (!dropdownMenu || forceReloadLabelsList) {
+        // 满足任一条件就重建：
+        //   条件A: dropdownMenu 不存在（首次打开，DOM中没有菜单）
+        //   条件B: forceReloadLabelsList === true（已置位）
         if (dropdownMenu) {
-            // 删除旧菜单 DOM
-            dropdownMenu.nextElementSibling.remove();
-            dropdownMenu.remove();
+            dropdownMenu.nextElementSibling.remove();   // 删除关闭按钮
+            dropdownMenu.remove();                       // 删除旧菜单 DOM
         }
-        // 加载模板 + AJAX 拉取最新标签列表
+        // 插入空模板 → 调用 loadDynamicTags() 发 AJAX 请求
         const template = document.getElementById('labels_article_template').innerHTML;
         div.insertAdjacentHTML('beforeend', template);
         return loadDynamicTags(div.closest('.dynamictags'));
     }
-    return true;  // 否则直接复用已有 DOM，不发请求
-}
+    return true;  // 仅当 dropdownMenu 存在 且 forceReloadLabelsList===false 时走此分支
 ```
 
-#### 性能优化：`forceReloadLabelsList` 的生命周期
+#### `forceReloadLabelsList` 的真实生命周期（单页面会话内）
 
 ```
-初始状态: forceReloadLabelsList = false
+页面加载: forceReloadLabelsList = false
   ↓
-用户打开文章A标签菜单 → 发请求，缓存菜单DOM
+阶段一：从未新建过标签
+  ├─ 打开文章A菜单 → dropdownMenu不存在 → 条件A满足 → AJAX请求 → DOM写入
+  ├─ 关闭后再打开A菜单 → dropdownMenu存在 + flag=false → 条件均不满足 → 复用DOM ★零请求
+  ├─ 打开文章B菜单 → dropdownMenu不存在 → 条件A满足 → AJAX请求 → DOM写入
+  └─ 关闭后再打开B菜单 → dropdownMenu存在 + flag=false → 复用DOM ★零请求
   ↓
-用户再次打开文章A菜单 → 不发请求，直接显示缓存 ★（流量优化点）
+用户在某篇文章中新建了一个标签
   ↓
-用户在文章B中**新建**了一个标签
+onloadend: forceReloadLabelsList = true  ← 永久置位，不会回退
   ↓
-onloadend 回调: forceReloadLabelsList = true
+阶段二：forceReloadLabelsList === true（永久）
+  ├─ 打开文章C菜单 → dropdownMenu不存在 → 条件A满足 → AJAX请求
+  ├─ 关闭后再打开C菜单 → dropdownMenu存在 + flag=true → 条件B满足 → 删除旧DOM → AJAX请求
+  ├─ 打开文章A菜单 → dropdownMenu存在 + flag=true → 条件B满足 → 删除旧DOM → AJAX请求
+  └─ 每次打开任何文章菜单 → 必然删除旧DOM → 必然AJAX请求 ★无法复用
   ↓
-用户打开任意文章的菜单 → 判断为 true → 删除旧缓存 → 重新AJAX拉取
-  ↓
-获取包含新标签的最新列表 → 重新缓存DOM
-  ↓
-后续打开 → 继续复用缓存，直到下一次新建标签
+  （直到页面刷新/导航离开，forceReloadLabelsList 才会随 JS 上下文销毁重置为 false）
 ```
 
-> 这个设计是**性能与正确性的权衡**：平时不开新标签时，所有文章共用一份缓存列表（零网络请求）；只有开新标签后才需要多花一次请求来保证数据一致。
+#### 对一致性和请求次数的影响
+
+| 场景 | 请求次数 | 说明 |
+|------|---------|------|
+| **从未新建标签** | 每篇文章首次打开 1 次，后续复用 0 次 | 条件A控制：首次没有 DOM 必须请求，之后有 DOM 且 flag=false 可复用 |
+| **新建标签后** | **每次打开菜单都 1 次** | 条件B控制：flag=true 导致每次都删除旧 DOM 并重新请求 |
+| **页面刷新后** | 回到"从未新建标签"状态 | flag 随页面重新初始化为 false |
+
+**一致性影响**：
+- 阶段一（flag=false）：标签列表依赖 DOM 缓存，如果其他用户/会话创建了新标签，当前页面不会感知。但在单用户场景下，缓存期内的列表是自洽的（只有自己能创建标签，自己刚操作过）。
+- 阶段二（flag=true）：每次打开菜单都是最新的服务端数据，**一致性最强**，但代价是每次打开都发网络请求。
+
+**请求次数影响**：
+- 这是**单向不可逆**的设计：一旦用户在当前会话中新建过标签，后续所有菜单打开都变成实时请求。
+- 注释中的 `purpose of this flag: minimize the network traffic` 指的是阶段一的优化——在用户没有新建标签时，通过 DOM 缓存避免重复请求。
+- 阶段二的"每次请求"并非设计疏忽，而是**正确性优先**的权衡：新建标签后，每篇文章的标签列表内容和勾选状态都可能不同（因为新标签对当前文章是 checked，对其他文章是 unchecked），只有按文章 ID 逐个查询 `getTagsForEntry` 才能拿到准确的 `checked` 状态。这意味着没有可靠的客户端缓存策略可以替代逐篇文章请求。
+
+#### 为什么不复用缓存？根本原因是 `checked` 状态因文章而异
+
+`getTagsForEntry` 返回的不仅是标签列表，还有每篇文章的 `checked` 状态：
+
+```json
+// 文章A（已打了"紧急"标签）
+[{id:1, name:"重要", checked:true}, {id:12, name:"紧急", checked:true}]
+
+// 文章B（没有打"紧急"标签）
+[{id:1, name:"重要", checked:false}, {id:12, name:"紧急", checked:false}]
+```
+
+两篇文章的返回结果不同——同样的标签列表，`checked` 布尔值不一样。因此：
+- **不能**用一个全局缓存给所有文章共用（checked 不对）
+- **不能**给每篇文章分别缓存（checked 可能因用户操作而变化）
+- 唯一安全的做法是每次打开菜单时重新向服务端请求
+
+所以 `forceReloadLabelsList=true` 后每次都发请求，本质上是 `checked` 状态差异化导致缓存不可复用的正确处理。
+
+#### 侧栏标签列表不受影响
+
+注意：侧栏的标签列表（[app/layout/aside_feed.phtml](app/layout/aside_feed.phtml#L69-L94)）是在页面初始渲染时由 PHP 生成的静态 HTML，`forceReloadLabelsList` 机制仅影响文章内的标签下拉菜单，不会触发侧栏的重新加载。侧栏的未读数更新通过 `incUnreadsTag()` 直接操作 DOM 实现，不依赖标签菜单的刷新。
 
 ### 5.3 侧栏标签列表的 HTML 结构（未读数回写目标）
 
