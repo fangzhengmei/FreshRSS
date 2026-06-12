@@ -735,16 +735,22 @@ if ($feed->priority() > FreshRSS_Feed::PRIORITY_HIDDEN) {
 
 ### 10.6 各计数器统计范围汇总表
 
-| 计数器 | 统计方法 | 优先级过滤 | 包含隐藏来源？ |
-|--------|---------|-----------|---------------|
-| 收藏总数 `total_starred['all']` | `JOIN _feed WHERE f.priority > -10` | `> PRIORITY_HIDDEN (-10)` | ❌ |
-| 收藏未读数 `total_starred['unread']` | 同上 | 同上 | ❌ |
-| 全局未读数 `total_unread` | `minPriority = MAIN_STREAM (10)` | `>= 10` | ❌ |
-| 重要未读数 `total_important_unread` | `minPriority = IMPORTANT (20)` | `>= 20` | ❌ |
-| 分类未读数 `cat.nbNotRead()` | `minPriority = FEED (-5)` | `>= -5` | ❌ |
-| Feed 未读数 `feed.nbNotRead()` | 按 feed_id 直接统计 | 无 | ✅（仅当查看该 feed 时） |
-| 标签未读数 `tag.nbUnread()` | `_entrytag JOIN _entry`，不 JOIN `_feed` | 无 | ✅ |
-| 前端 JS feed 映射 | `f.priority > -10` | `> PRIORITY_HIDDEN` | ❌ |
+| 计数器 | 统计方法 / 来源 | 优先级过滤条件 | 包含隐藏来源？ | 与对应列表查询是否一致 |
+|--------|----------------|---------------|---------------|----------------------|
+| 收藏总数 `total_starred['all']` | `countUnreadReadFavorites()` → `JOIN _feed WHERE f.priority > -10` | `> PRIORITY_HIDDEN (-10)` | ❌ 不包含 | ✅ 一致（`sqlListWhere('s')` 也用 `> -10`） |
+| 收藏未读数 `total_starred['unread']` | 同上 | 同上 | ❌ 不包含 | ✅ 一致 |
+| 全局未读数 `total_unread` | `Category::countUnread(categories, PRIORITY_MAIN_STREAM)` | `>= PRIORITY_MAIN_STREAM (10)` | ❌ 不包含 | ⚠️ 部分一致（主视图 `a` 一致，但 `A`/`Z` 视图列表更宽，`get_unread` 仍用此值） |
+| 重要未读数 `total_important_unread` | `Category::countUnread(categories, PRIORITY_IMPORTANT)` | `>= PRIORITY_IMPORTANT (20)` | ❌ 不包含 | ✅ 一致（`sqlListWhere('i')` 也用 `>= 20`） |
+| 分类未读数 `cat.nbNotRead()` | 默认 `minPriority = PRIORITY_FEED (-5)`，有两条路径：<br>1. feeds 未加载 → `CategoryDAO::countNotRead(id, PRIORITY_FEED)` SQL 查询<br>2. feeds 已加载 → PHP 循环 `>= -5` 累加 | `>= PRIORITY_FEED (-5)`（等效于 `> PRIORITY_HIDDEN`） | ❌ 不包含 | ⚠️ **不一致**（分类视图列表 `sqlListWhere('c')` 用 `>= 0`，比未读数统计更严格） |
+| Feed 未读数 `feed.nbNotRead()` | `cache_nbUnreads` 字段，按 feed_id 直接统计 | 无（不判断自身优先级） | ✅ 包含 | ✅ 一致（进入该 feed 时直接显示） |
+| 单标签未读数 `tag.nbUnread()` | `TagDAO::countNotRead(id)` → `_entrytag JOIN _entry` | 无（不 JOIN feed） | ✅ 包含 | ✅ 一致（`sqlListWhere('t')` 也无优先级过滤） |
+| 全标签未读数 | 同上，不带 id 参数 | 无（不 JOIN feed） | ✅ 包含 | ✅ 一致（`sqlListWhere('T')` 也无优先级过滤） |
+| 前端 JS feed 映射 | `nbUnreadsPerFeed.phtml` 中 `f.priority > -10` 过滤 | `> PRIORITY_HIDDEN (-10)` | ❌ 不包含 | ✅ 与侧栏显示一致 |
+| 标签列表总数 | `TagDAO::countAll()` 或类似 | 无（不 JOIN feed） | ✅ 包含 | ✅ 一致 |
+
+> **关键不对称**：收藏统计始终排除隐藏来源，标签统计始终包含隐藏来源。这是因为收藏与 feed 优先级强绑定（收藏的"可见性"取决于来源优先级），而标签是独立于 feed 的元数据体系。
+
+> ⚠️ **注意 `A`/`Z` 视图的 `get_unread` 偏差**：全局 `total_unread` 只统计主流（>=10），但 `A` 视图列表包含分类级（>=0）、`Z` 视图包含所有来源。因此在 `A`/`Z` 视图下，标题栏和侧栏的未读数可能与列表实际未读条目数不一致。这是已知的设计取舍，`total_unread` 作为"主要"数字只反映主流内容。
 
 ---
 
@@ -857,7 +863,7 @@ case 's':
 
 | `type` | 视图 | 优先级条件 | 说明 |
 |--------|------|-----------|------|
-| `'a'` | 全部（主流） | `f.priority >= min(MAIN_STREAM(10), needVisibility)` | 只显示主流及以上 |
+| `'a'` | 全部（主流） | `f.priority >= 10` | `> 0` | 只显示主流及以上 |
 | `'A'` | 全部（含分类） | `f.priority >= min(CATEGORY(0), needVisibility)` | 显示分类级及以上 |
 | `'Z'` | 全部（含隐藏） | `1=1`（无限制） | 显示所有，包括隐藏 |
 | `'i'` | 重要 | `f.priority >= min(IMPORTANT(20), needVisibility)` | 只显示重要来源 |
@@ -1131,7 +1137,9 @@ public function feeds(): array {
 - 与侧栏显示的分类未读数一致
 - 但 `$this->feeds` 数组**包含**隐藏来源的 feed 对象（只是不计入未读数）
 
-这与 `Category::nbNotRead($minPriority)` 传入不同参数时的行为不同：`nbNotRead()` 无参数默认使用 `PRIORITY_FEED (-5)`，比 `feeds()` 中的 `> PRIORITY_HIDDEN (-10)` 更严格。但 `feeds()` 懒加载缓存的 `$this->nbNotRead` 只在 `$minPriority === PRIORITY_FEED` 时返回缓存值，否则重新查询。
+> 💡 **等价性说明**：`> PRIORITY_HIDDEN (-10)` 与 `>= PRIORITY_FEED (-5)` **效果完全相同**。因为 priority 只能取 5 个离散值（20, 10, 0, -5, -10），不存在介于 -10 和 -5 之间的值。`> -10` 命中的值恰好就是 `>= -5` 命中的值。
+
+`Category::nbNotRead($minPriority)` 无参数默认使用 `PRIORITY_FEED (-5)`，即 `>= -5`。由于上述等价性，`feeds()` 中 `> -10` 计算出的 `$this->nbNotRead` 缓存值与 `nbNotRead()` 使用默认参数时的返回值**完全一致**。代码中的缓存命中判断 `if ($this->nbNotRead > 0 && $minPriority === PRIORITY_FEED)` 正是依赖这个等价关系——只有当请求的 `$minPriority` 等于默认值时才使用缓存，其他情况（如传入 `PRIORITY_CATEGORY (0)` 或 `PRIORITY_MAIN_STREAM (10)`）则走 SQL 重新查询。
 
 ### 14.5 侧栏 feed 节点的优先级过滤
 
