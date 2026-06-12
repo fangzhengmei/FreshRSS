@@ -624,6 +624,8 @@ Minz_ExtensionManager::callHookVoid(Minz_HookType::FreshrssUserMaintenance);  //
 
 **涉及表：** `category`, `feed`, `entry`, `entrytmp`, `tag`, `entrytag`
 
+> ⚠️ **不会失效 HTTP 缓存**：`db-optimize.php` 执行完 `optimize()` 后直接调用 `done($ok)` 退出，**没有调用 `invalidateHttpCache()`**。这意味着优化后用户的 Web 客户端不会感知到数据变化——浏览器仍使用旧的 `If-Modified-Since` / `ETag` 条件请求命中缓存，直到其他操作（刷新、清理）触发缓存失效。对比其他命令：`actualize-user.php`（[L49](file:///d:/fz/0601-1/solo-dogfeeding/code/30-FreshRSS/cli/actualize-user.php#L49)）、`purge.php`（[L39](file:///d:/fz/0601-1/solo-dogfeeding/code/30-FreshRSS/cli/purge.php#L39)）、`actualize_script.php`（[L108](file:///d:/fz/0601-1/solo-dogfeeding/code/30-FreshRSS/app/actualize_script.php#L108)）均在执行完毕后调用了 `invalidateHttpCache()`。如果需要在优化后立即让客户端看到变化，应手动执行 `touch data/users/{username}/` 或在优化后触发一次刷新。
+
 ### purge.php - 清理旧条目
 
 [`cli/purge.php`](file:///d:/fz/0601-1/solo-dogfeeding/code/30-FreshRSS/cli/purge.php)
