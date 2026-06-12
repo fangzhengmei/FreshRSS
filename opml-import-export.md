@@ -187,6 +187,38 @@ Web 端受限制，达上限后记录警告并停止创建；CLI 模式（`Fresh
 在 `ExportService` 中：
 - `generateStarredEntries()` 和 `generateFeedEntries()` 均调用 `toGReader('freshrss')` → 写入 `feedUrl`，**不写入分类名到 categories**
 
+### 3.5 导出路径完整验证：标签名的获取与写入
+
+标签名（Label）的导出经过完整链路：
+
+```
+ExportService::generateStarredEntries() / generateFeedEntries()
+    ↓
+1. 先获取文章 ID 列表：entry_dao->listIdsWhere(...)
+    ↓
+2. 批量获取每篇文章的标签名：tag_dao->getEntryIdsTagNames($entriesId)
+   │  实现：联表查询 _tag + _entrytag
+   │  返回结构：['e_文章ID' => ['标签名1', '标签名2'], ...]
+   ↓
+3. 渲染视图 articles.phtml
+    ↓
+4. 遍历文章，调用 toGReader('freshrss', $labels)
+   │  $labels = entryIdsTagNames['e_' . entryId] ?? []
+   ↓
+5. toGReader() 内部：
+   ├─ 遍历 $labels（用户标签/Label）：
+   │     categories[] = 'user/-/label/' + 标签名
+   └─ 遍历 $this->tags()（文章固有 tags，_entry.tags 字段）：
+         categories[] = 标签名（无前缀，直接写入）
+```
+
+**代码证据**：
+- [ExportService.php L78-L79](file:///d:/fz/0601-1/solo-dogfeeding/code/26-FreshRSS/app/Services/ExportService.php#L78-L79)：`getEntryIdsTagNames()` 获取标签
+- [articles.phtml L34](file:///d:/fz/0601-1/solo-dogfeeding/code/26-FreshRSS/app/views/helpers/export/articles.phtml#L34)：传入 `toGReader('freshrss', $labels)`
+- [Entry.php L1312-L1317](file:///d:/fz/0601-1/solo-dogfeeding/code/26-FreshRSS/app/Models/Entry.php#L1312-L1317)：分别写入用户 Label 和文章固有 tags
+
+> **✅ 结论：导出路径正确地写出了用户标签名（Label，带 `user/-/label/` 前缀）和文章固有 tags（无前缀）。但订阅所属分类名在 `freshrss` 模式下不被写入 categories。**
+
 ---
 
 ## 四、文章导入：如何从来源信息找回原订阅
