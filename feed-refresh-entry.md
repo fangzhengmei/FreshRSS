@@ -2,7 +2,23 @@
 
 ## 一、触发入口矩阵
 
-FreshRSS 通过以下 **8 种独立入口** 触发 Feed 刷新 / 条目入库：
+FreshRSS 通过以下 **8 个独立触发入口** 触发 Feed 刷新 / 条目入库，外加 **2 个阅读器 API 调用渠道**（§1.9，映射到上述入口）：
+
+| 编号 | 入口名称 | 核心调用 | 独立性 |
+|------|---------|---------|--------|
+| 1.1 | Web UI 手动刷新 | `actualizeAction()` | ✅ 独立入口 |
+| 1.2 | 添加 Feed 时首次刷新 | `addFeed()` → `actualizeFeedsAndCommit(id)` | ✅ 独立入口 |
+| 1.3 | 系统级 CLI 全量刷新 (Cron) | `actualize_script.php` | ✅ 独立入口 |
+| 1.4 | 单用户 CLI 刷新 | `actualize-user.php` | ✅ 独立入口 |
+| 1.5 | WebSub 实时推送 | `pshb.php` | ✅ 独立入口 |
+| 1.6 | JavaScript 后台自动刷新 | AJAX 轮询 `actualizeAction` | ✅ 独立入口 |
+| 1.7 | 导入订阅批量入库 | `importFile()` / `importJson()` | ✅ 独立入口 |
+| 1.8 | 重新抓取 (Reload Articles) | `reloadAction()` → 强制刷新 + 全文重抓 | ✅ 独立入口 |
+| 1.9 | 阅读器 API 渠道 | GReader API / Fever API | ⚠️ 调用渠道，映射到 1.2 / 1.7 |
+
+> **分类说明**：
+> - **独立入口**：代码位置、调用方式、参数组合有显著差异，直接发起刷新/入库请求
+> - **调用渠道**：通过 API 间接调用，最终映射到上述独立入口（如 GReader quickadd → addFeed → 1.2）
 
 ---
 
@@ -90,7 +106,7 @@ actualizeFeedsAndCommit(feed_url: $canonical, simplePiePush: $simplePie, selfUrl
 
 ---
 
-### 1.7 导入订阅时批量入库
+### 1.7 导入订阅（批量入库 + 导入后刷新机制）
 **入口**: [importExportController.php](file:///d:/fz/0601-1/solo-dogfeeding/code/21-FreshRSS/app/Controllers/importExportController.php) + CLI [import-for-user.php](file:///d:/fz/0601-1/solo-dogfeeding/code/21-FreshRSS/cli/import-for-user.php)
 
 支持两种调用方式：
@@ -110,7 +126,7 @@ actualizeFeedsAndCommit(feed_url: $canonical, simplePiePush: $simplePie, selfUrl
 
 导入顺序 (L111-L113)：**OPML 先** → 收藏/标签中 → 其他文章最后，确保 feed 存在后再导入条目。
 
-#### JSON 条目导入的核心链路
+#### 1.7.1 JSON 条目导入的核心链路
 [importExportController.php](file:///d:/fz/0601-1/solo-dogfeeding/code/21-FreshRSS/app/Controllers/importExportController.php) L331-L592 `importJson()`:
 
 ```
@@ -139,9 +155,7 @@ actualizeFeedsAndCommit(feed_url: $canonical, simplePiePush: $simplePie, selfUrl
 - 事务粒度更细（3 段式事务），避免大事务锁定过长
 - `is_read`/`is_favorite` 状态从导入文件中读取，不应用自动标记规则
 
----
-
-### 1.9 导入后 Feed 刷新的触发机制（按入口分别说明）
+#### 1.7.2 导入后 Feed 刷新触发机制（跨 5 种调用路径）
 
 **核心公共服务**：[ImportService.php](file:///d:/fz/0601-1/solo-dogfeeding/code/21-FreshRSS/app/Services/ImportService.php) 的 `importOpml()` (L36-L133)
 
@@ -151,10 +165,11 @@ $id = $this->feedDAO->addFeedObject($feed);   // 直接 SQL INSERT，不触发 a
 ```
 实际刷新由各调用入口**在 ImportService 返回后**独立触发，形成 **"写入 Feed → 调用方决定是否刷新"** 的分层结构。
 
-#### 1.9.1 Web UI 手动导入（importExportController）
-**入口代码**：[importExportController.php](file:///d:/fz/0601-1/solo-dogfeeding/code/21-FreshRSS/app/Controllers/importExportController.php) 的 `importAction()` (L176-L216) 调用 `importFile()` (L63-L165)
+**路径 1：Web UI 手动导入（importExportController）**
 
-**刷新触发**：**没有直接触发刷新！**
+[importExportController.php](file:///d:/fz/0601-1/solo-dogfeeding/code/21-FreshRSS/app/Controllers/importExportController.php) L176-L216 的 `importAction()` 调用 `importFile()` (L63-L165)
+
+**刷新触发：❌ 不触发刷新**
 - `importFile()` 完成后直接返回 `$ok` 状态，Web UI 导入**不主动刷新任何 Feed**
 - 新导入的 Feed 全部保持 `lastUpdate=0`（未更新状态）
 - 刷新交由以下机制触发：
@@ -163,56 +178,34 @@ $id = $this->feedDAO->addFeedObject($feed);   // 直接 SQL INSERT，不触发 a
   3. 下一次 cron 任务执行（§1.3）
 - 只有当 ZIP 中包含 **JSON 条目文件**（不只是 OPML）时，才在 `importJson()` 内直接写入条目（无 HTTP 抓取）
 
-#### 1.9.2 CLI 批量导入（import-for-user.php）
-**入口代码**：[import-for-user.php](file:///d:/fz/0601-1/solo-dogfeeding/code/21-FreshRSS/cli/import-for-user.php) L32-L44
+**路径 2：CLI 批量导入（import-for-user.php）**
 
-**刷新触发**：同样 **不触发刷新**，同 1.10.1。只做：
+[import-for-user.php](file:///d:/fz/0601-1/solo-dogfeeding/code/21-FreshRSS/cli/import-for-user.php) L32-L44
+
+**刷新触发：❌ 不触发刷新**（同路径 1）
 ```php
 $ok = $importController->importFile($filename, $filename, $username);
 invalidateHttpCache($username);   // 只清 HTTP 缓存，不触发 actualize
 done($ok);
 ```
 
-#### 1.9.3 Google Reader API 导入（greader.php subscription/import）
-**入口代码**：[greader.php](file:///d:/fz/0601-1/solo-dogfeeding/code/21-FreshRSS/p/api/greader.php) L325-L336 `subscriptionImport()`
+**路径 3：GReader API subscription/import**
 
-**刷新触发：主动全量刷新！**
-```php
-$importService = new FreshRSS_Import_Service($user);
-$importService->importOpml($opml);           // 写 Feed 到 DB
-if ($importService->lastStatus()) {
-    FreshRSS_feed_Controller::actualizeFeedsAndCommit();   // ◀── 立即全量刷新！
-    invalidateHttpCache($user);
-    exit('OK');
-}
-```
-- **唯一在 ImportService 后立即显式调用 `actualizeFeedsAndCommit()` 的路径**
-- 传参数全为空：刷新 `lastUpdate=0` 或超过 TTL 的全部 Feed（恰好就是刚导入的新 Feed）
-- 与 JSON 条目导入的区别：通过 HTTP 真正抓取源站，而不是从文件读取条目
+见 §1.9.1。
 
-#### 1.9.4 Google Reader API 订阅（greader.php subscribe/quickadd）
-**入口 1**：[greader.php](file:///d:/fz/0601-1/solo-dogfeeding/code/21-FreshRSS/p/api/greader.php) L485-L505 `quickadd()`
-```php
-case 'quickadd':   // reader/api/0/subscription/quickadd?quickadd=http://...
-    $feed = FreshRSS_feed_Controller::addFeed($url);
-    // addFeed() 内部已调用 actualizeFeedsAndCommit()，无需额外刷新
-```
-**入口 2**：[greader.php](file:///d:/fz/0601-1/solo-dogfeeding/code/21-FreshRSS/p/api/greader.php) L390-L483 `subscriptionEdit()` action='subscribe'
-```php
-case 'subscribe':
-    FreshRSS_feed_Controller::addFeed($streamUrl, $title, $addCatId, '', $http_auth);
-    // addFeed() 内部已调用 actualizeFeedsAndCommit()
-```
-两者都直接调用 `feedController::addFeed()`（§1.2），该方法末尾已内置 `actualizeFeedsAndCommit($id, $url)`，**是同步阻塞式刷新**。
+**路径 4：GReader API subscribe / quickadd**
 
-#### 1.10.5 动态 OPML 分类刷新（Category::refreshDynamicOpml）
-**入口代码**：[Category.php](file:///d:/fz/0601-1/solo-dogfeeding/code/21-FreshRSS/app/Models/Category.php) L212-L296 `refreshDynamicOpml()`
+见 §1.9.1。
+
+**路径 5：动态 OPML 分类刷新（Category::refreshDynamicOpml）**
+
+[Category.php](file:///d:/fz/0601-1/solo-dogfeeding/code/21-FreshRSS/app/Models/Category.php) L212-L296 `refreshDynamicOpml()`
 
 被以下位置触发：
 - `actualizeFeedsAndCommit()` 中全量刷新后自动调用
 - `actualize-user.php` 第 63 行显式调用
 
-**刷新机制**（两阶段 dry-run 对比）：
+**刷新机制（两阶段 dry-run 对比）**：
 ```
 阶段 A：Dry Run 预览
   httpGet(opml_url) → 拉远程 OPML
@@ -222,25 +215,13 @@ case 'subscribe':
 
 阶段 B：差异比对 & 真正落库
   遍历 dryRun 结果 vs 当前 category->feeds():
-    • 新增 URL：feedDAO->addFeedObject() 直接 DB INSERT，**不触发刷新**
+    • 新增 URL：feedDAO->addFeedObject() 直接 DB INSERT，❌ 不触发刷新
     • 消失的 URL：mute=true（ttl 设为负数，非删除）
     • 已存在且 mute：mute=false 解封
 
   最后：catDAO->updateLastUpdate() / updateLastError()
 ```
 **新加入的 Feed 不立即刷新**，等下一次 cron/TTL 触发。只有 `unmute` 操作会让 Feed 重新在下一轮 `actualizeFeeds` 中被 TTL 机制选中。
-
-#### 导入刷新触发矩阵汇总
-
-| 调用入口 | 导入 Feed 方式 | 是否触发刷新 | 触发方式 |
-|---------|-------------|----------|---------|
-| Web UI 导入 | `ImportService::importOpml` | ❌ 不触发 | 依赖 AJAX/cron 被动刷新 |
-| CLI import-for-user | `ImportService::importOpml` | ❌ 不触发 | 同上 |
-| **GReader API subscription/import** | `ImportService::importOpml` | ✅ **立即全量刷新** | 显式 `actualizeFeedsAndCommit()` (无参数) |
-| GReader API quickadd | `feedController::addFeed()` | ✅ **同步刷新** | addFeed() 内置 `actualizeFeedsAndCommit(id,url)` |
-| GReader API subscribe | `feedController::addFeed()` | ✅ **同步刷新** | 同上 |
-| 动态 OPML 刷新 | `ImportService(dry_run=true)` + 自写 SQL | ❌ 不立即刷新 | 新 Feed 等下一次 TTL 周期 |
-| Fever API | **只读，不支持订阅导入** | — | — |
 
 ---
 
@@ -284,6 +265,91 @@ $entry->loadCompleteContent(true);
 - **MySQL**：用第二个独立 PDO 连接（关闭共享 PDO）做非缓冲查询流式处理
 - **SQLite / PostgreSQL**：单连接内存缓冲查询
 - 只更新 `content` 字段，**不会触发 hash 变化**（因为 hash 用的是 `originalContent()`，FULLCONTENT 追加段不计入）
+
+---
+
+### 1.9 阅读器同步 API（GReader API + Fever API）
+
+FreshRSS 提供两套移动阅读器兼容 API，调用方式与刷新链路如下：
+
+#### 1.9.1 Google Reader API（[greader.php](file:///d:/fz/0601-1/solo-dogfeeding/code/21-FreshRSS/p/api/greader.php)）
+
+鉴权方式：`?output=json`，登录 Cookie 或 `?auth=xxx` Google ClientLogin 风格令牌
+
+核心导入/刷新端点：
+
+| 路由 (reader/api/0/*) | 调用的内部函数 | 刷新行为 |
+|----------------------|-------------|---------|
+| **subscription/import** POST | `subscriptionImport()` (L325) | `ImportService::importOpml` → **立即全量刷新** `actualizeFeedsAndCommit()` |
+| **subscription/quickadd** POST | `quickadd()` (L485) | `feedController::addFeed()` → 同步刷新单 Feed |
+| **subscription/edit** POST action=subscribe | `subscriptionEdit()` case subscribe (L450) | `feedController::addFeed()` → 同步刷新单 Feed |
+| subscription/edit POST action=unsubscribe | `subscriptionEdit()` case unsubscribe (L462) | 只删 Feed，不刷新 |
+| subscription/edit POST action=edit | `subscriptionEdit()` case edit (L467) | 只改分类/标题，不刷新 |
+| subscription/list GET | `subscriptionList()` (L338) | 只读，不触发刷新 |
+| subscription/export GET | `subscriptionExport()` (L315) | 只读，不触发刷新 |
+| tag/edit POST | `editTag()` | 只改条目状态，不触发刷新 |
+
+**路径 3 完整调用链（subscription/import → 全量刷新）**：
+```
+阅读器 OPML 导入界面
+    │ POST /api/greader.php/reader/api/0/subscription/import
+    │   multipart/form-data: 包含 OPML 文件
+    ▼
+subscriptionImport($opml_body)             [L325-L336]
+    │
+    ├─ ① ImportService->importOpml($opml)   只写 Feed，不刷新   [ImportService.php L36]
+    │     └─ createFeed()->feedDAO->addFeedObject()
+    │
+    └─ ② actualizeFeedsAndCommit()         ◀── 立即全量刷新新导入的 Feed
+            ├─ actualizeFeeds()             批量 HTTP 拉取+解析+去重
+            └─ commitNewEntries()           tmp→entry 迁移
+    │
+    ▼
+返回 "OK" 纯文本
+```
+
+**路径 4 完整调用链（quickadd → 单 Feed 同步刷新）**：
+```
+移动端阅读器 App (Reeder/NetNewsWire 等)
+    │ POST /api/greader.php/reader/api/0/subscription/quickadd
+    │   ?quickadd=http://example.com/feed.xml&T=csrf_token
+    ▼
+p/api/greader.php 路由分发
+    │
+    ▼
+quickadd($_REQUEST['quickadd'])            [L485-L505]
+    │
+    ▼
+FreshRSS_feed_Controller::addFeed($url)    [feedController.php L39-L117]
+    ├─ ① feedDAO->addFeedObject()           写 DB
+    └─ ② actualizeFeedsAndCommit($id,$url)  ◀── 同步阻塞刷新
+            └─ actualizeFeeds() + commitNewEntries()
+    │
+    ▼
+返回 JSON: {streamId: "feed/123", streamName: "..."}
+```
+
+**关键点**：这是 **ImportService 之后唯一立即显式调用 `actualizeFeedsAndCommit()` 的路径**。
+
+#### 1.9.2 Fever API（[fever.php](file:///d:/fz/0601-1/solo-dogfeeding/code/21-FreshRSS/p/api/fever.php)）
+
+鉴权方式：`api_key` 参数（MD5(email:password)）
+
+Fever API **只支持读操作**，没有订阅导入/编辑端点：
+
+| Fever 端点 | 对应方法 | 刷新行为 |
+|-----------|---------|---------|
+| `?groups` | `getGroups()` | 只读返回分类列表 |
+| `?feeds` | `getFeeds()` | 只读返回 Feed 列表 |
+| `?items` | `getItems()` (L336) | 只读返回条目数据 |
+| `?unread_item_ids` | `getUnreadItemIds()` | 只读返回未读 ID 列表 |
+| `?saved_item_ids` | `getSavedItemIds()` | 只读返回收藏 ID 列表 |
+| `?links` | `getLinks()` | 只读返回热链 |
+| `?mark=item&as=read&id=xxx` | 写 DB 标读 | 只改状态，不触发刷新 |
+| `?mark=feed&as=read&id=xxx` | 写 DB 标读 | 只改状态，不触发刷新 |
+| `?mark=group&as=read&id=xxx` | 写 DB 标读 | 只改状态，不触发刷新 |
+
+**结论**：Fever API 用户要新增/导入 Feed，必须通过 Web UI、GReader API 或 CLI。Fever 协议本身不包含订阅管理。
 
 ---
 
@@ -759,22 +825,36 @@ END $$;
 ## 七、完整调用图总览
 
 ```
-用户 / Cron / WebSub / JS / 导入 / 重抓
+移动端阅读器 ─┐ (Reeder, NetNewsWire 等)
+Web UI ───────┤ 上传 ZIP/OPML / 点按钮 / 手动订阅
+Cron ─────────┤ 定时 actualize_script.php
+CLI ──────────┤ actualize-user.php / import-for-user.php
+WebSub ───────┤ Hub 推送 pshb.php
+动态 OPML ────┘ 远程列表刷新 Category::refreshDynamicOpml()
     │
     ▼
-┌──────────────────────────────────────────────────────────┐
-│ actualizeAction  │  actualize-user.php  │  pshb.php      │
-│ addFeed          │  actualize_script.php│  importJson    │
-│ reloadAction     │                      │                │
-└────────────────────┬─────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────────────┐
+│  GReader API 路由 (p/api/greader.php)     │  Web/CLI 直接入口            │
+│  ├ subscription/import → ImportService   │  ├ actualizeAction           │
+│  │                 ↘ (无参数全量刷新)      │  ├ addAction → addFeed()     │
+│  │                    actualizeAndCommit  │  ├ reloadAction              │
+│  ├ subscription/quickadd → addFeed()     │  ├ importAction              │
+│  ├ subscription/edit subscribe → addFeed │  │    ↘ (不刷新,被动等cron)  │
+│  └ subscription/edit edit/unsubscribe    │  └ cli/import-for-user.php  │
+│                                            │    ↘ (同上,不立即刷新)      │
+│  Fever API (p/api/fever.php)              │                            │
+│  └ 只读: groups/feeds/items/...           │  CLI actualize scripts     │
+│     无订阅导入端点                          │  ├ actualize_script.php     │
+└────────────────────────────────────────────────────────────────────────┘
+                     │
                      ▼
-        actualizeFeedsAndCommit()  ──────────────┐
-                     │                            │
+        actualizeFeedsAndCommit()  ◀── GReader import / addFeed / reload
+                     │                            ▲
                      ▼                            │
-           ┌── actualizeFeeds() ──┐               │
-           │  1. 过滤 Feeds       │               │
+           ┌── actualizeFeeds() ──┐               │ addFeed 传 id
+           │  1. 过滤 Feeds       │               │ reload 传 id+lastUpdate=0
            │  2. SimplePie 解析   │               │
-           │  3. loadGuids()      │               │
+           │  3. loadGuids()      │               │ import 无参数→全局
            │     └ decideEntryGuid 降级           │
            │  4. loadEntries()                    │
            │     └ Entry->hash() (md5)            │
@@ -785,6 +865,7 @@ END $$;
            │        (自动 loadCompleteContent)    │
            │  7. updateLastSeen                   │
            │  8. 概率 cleanOldEntries             │
+           │  9. refreshDynamicOpmls (全量才跑)   │
            └───────────────────┬──────────────────┘
                                │
                                ▼
