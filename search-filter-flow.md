@@ -1311,40 +1311,169 @@ private static function applyLabelActions(int $nbNewEntries): int|false {
 
 > **重要**：Tag 对象在链路 B 中虽然也调用 `FilterActionsTrait::applyFilterActions()`，但通过 UI 限制（[tag/update.phtml](file:///d:/fz/0601-1/solo-dogfeeding/code/24-FreshRSS/app/views/helpers/tag/update.phtml#L44-L51) + [tagController.php#L121](file:///d:/fz/0601-1/solo-dogfeeding/code/24-FreshRSS/app/Controllers/tagController.php#L121)），Tag 只能配置 `label` 动作，不能配置 `read` 或 `star`。因此链路 B 中即使遍历所有 Tag，也不会触发 `read`/`star` 动作。
 
-### 9.4 过滤动作与搜索结果的协作边界
+### 9.4 三条路径的协作边界：为什么 label 必须走独立链路？
+
+同一套搜索条件模型（`FreshRSS_BooleanSearch + FreshRSS_Search`）被三条完全不同的执行路径复用。这三条路径不是设计上的随意拆分，而是由**数据模型的持久化边界**决定的。
 
 ```
-┌──────────────────────────────────────────────────────────────────┐
-│                    搜索条件模型 (共享)                           │
-│         FreshRSS_BooleanSearch + FreshRSS_Search                │
-│                                                                  │
-│  定义"匹配什么"——与执行路径无关的纯条件描述                      │
-└───────────────┬──────────────────────────┬───────────────────────┘
-                │                          │
-        ┌───────┴───────┐          ┌───────┴───────┐
-        ▼               ▼          ▼               ▼
-   用户搜索路径    自动规则路径   FilterAction    Entry::matches()
-   (批量查询)     (逐条匹配)    (条件+动作绑定)  (内存匹配引擎)
-        │               │          │               │
-        ▼               ▼          ▼               ▼
-   sqlBooleanSearch  applyFilter  toJSON/fromJSON  strilike/preg_match
-   (SQL WHERE)       Actions()   (持久化)          (字段级对比)
+                    ┌──────────────────────────────────────┐
+                    │     搜索条件模型（共享契约）         │
+                    │  FreshRSS_BooleanSearch              │
+                    │  + FreshRSS_Search                   │
+                    │  纯值对象 · 不包含执行语义           │
+                    └──────────────┬──────────┬───────────┘
+                                   │          │
+               ┌───────────────────┘          │
+               ▼                              ▼
+    ┌──────────────────────┐        ┌──────────────────────┐
+    │  路径①：用户搜索    │        │  自动规则路径        │
+    │  (SQL 查询引擎)     │        │  (PHP 内存匹配)     │
+    └──────────┬───────────┘        └───────┬──────────────┘
+               │                            │
+               │                   ┌────────┴─────────┐
+               │                   ▼                  ▼
+               │        ┌─────────────────┐  ┌─────────────────┐
+               │        │  路径②：顺序   │  │  路径③：标签   │
+               │        │  动作链路      │  │  独立链路      │
+               │        │  (Entry 属性)  │  │  (关联表)      │
+               │        └─────────────────┘  └─────────────────┘
+               ▼
+    EntryDAO::sqlBooleanSearch
+    → SQL WHERE → 数据库执行 → Generator
 ```
 
-**协作边界总结**：
+---
 
-| 维度 | 用户搜索路径 | 自动规则路径 |
-|------|-------------|-------------|
-| 搜索条件来源 | HTTP请求 `search` 参数 | 宿主对象 `attributes.filters` |
-| 匹配引擎 | 数据库 SQL 引擎 | PHP 内存 `Entry::matches()` |
-| 匹配时机 | 用户请求时 | 条目入库时 |
-| 匹配粒度 | 批量（成千上万条） | 逐条 |
-| 输出 | 匹配条目的 Generator | 布尔值 → 触发动作 |
-| 可执行动作 | 无（纯筛选） | read / star / label |
-| 搜索条件接口 | `FreshRSS_BooleanSearch` 对象 | 同左（完全复用） |
-| 条件描述语言 | 同一套搜索语法 | 同一套搜索语法 |
+#### 9.4.1 路径①：用户搜索路径（SQL 查询引擎）
 
-**关键设计**：搜索条件模型是纯值对象，不包含任何执行语义。它是两条路径之间的"共享契约"——无论 SQL 引擎还是 PHP 引擎，对同一搜索条件的匹配结果必须一致。
+**触发时机**：用户在 Web 界面或 API 中输入搜索词，请求文章列表时。
+
+**执行入口**：
+- [indexController.php#L104-L196](file:///d:/fz/0601-1/solo-dogfeeding/code/24-FreshRSS/app/Controllers/indexController.php#L104-L196) `normalAction()`
+- [Context.php#L239-L317](file:///d:/fz/0601-1/solo-dogfeeding/code/24-FreshRSS/app/Models/Context.php#L239-L317) `updateUsingRequest()` 解析 HTTP 参数
+
+**执行动作**：
+
+| 步骤 | 操作 | 代码位置 |
+|------|------|---------|
+| 1 | 从 HTTP `search` 参数获取原始搜索字符串 | Context 参数解析 |
+| 2 | 构造 `FreshRSS_BooleanSearch` 对象，解析布尔逻辑和括号 | BooleanSearch 构造函数 |
+| 3 | 内部构造 `FreshRSS_Search` 对象，解析 `intitle:`/`author:` 等原子标记 | Search 构造函数 |
+| 4 | 调用 `EntryDAO::sqlBooleanSearch()` 将搜索对象转为 SQL WHERE 子句 | [EntryDAO.php#L950-L1381](file:///d:/fz/0601-1/solo-dogfeeding/code/24-FreshRSS/app/Models/EntryDAO.php#L950-L1381) |
+| 5 | 数据库执行 SQL，通过 Generator 逐行返回结果 | EntryDAO::listWhere() |
+
+**持久化边界**：
+
+此路径是**只读**的——不修改任何数据库记录。搜索条件仅用于筛选已有数据，结果以 Generator 形式返回给视图层渲染。
+
+```
+持久化边界：用户搜索路径 ──READ ONLY──► _entry 表
+                              不写入任何表
+```
+
+---
+
+#### 9.4.2 路径②：顺序动作链路（User → Category → Feed）
+
+**触发时机**：Feed 刷新时，每个新条目（或更新条目）在写入临时表**之前**，在内存中逐条执行。
+
+精确调用栈：[feedController.php#L703-L704](file:///d:/fz/0601-1/solo-dogfeeding/code/24-FreshRSS/app/Controllers/feedController.php#L703-L704)
+```
+Feed刷新
+  → 解析 SimplePie 条目
+  → 分配临时 ID ($entry->_id(uTimeString()))
+  → EntryBeforeInsert Hook
+  → Entry::applyFilterActions()   ← 路径② 在此触发
+  → EntryBeforeAdd Hook
+  → EntryDAO::addEntry(useTmpTable=true)  ← 写入 _entrytmp 临时表
+```
+
+**执行动作**：
+
+| 层级 | 顺序 | 可执行动作 | 守卫条件 |
+|------|------|----------|---------|
+| User 全局配置 | 第 1 层 | `read` + `star` | read: `!isRead`; star: `!isUpdated` |
+| Category 分类 | 第 2 层 | 仅 `read` | `!isRead` |
+| Feed 订阅源 | 第 3 层 | 仅 `read` | `!isRead` |
+
+**为什么 label 不在此链路执行？——持久化边界的根本原因**：
+
+1. **临时表写入问题**：此时 `addEntry()` 写入的是 `_entrytmp` 临时表（[EntryDAO.php#L195](file:///d:/fz/0601-1/solo-dogfeeding/code/24-FreshRSS/app/Models/EntryDAO.php#L195)），不是主表。
+2. **ID 重分配问题**：`commitNewEntries()` 在将数据从 `_entrytmp` 搬到 `_entry` 主表时，会用 `@rank:=@rank+1` **重新分配自增 ID**（[EntryDAO.php#L267-L275](file:///d:/fz/0601-1/solo-dogfeeding/code/24-FreshRSS/app/Models/EntryDAO.php#L267-L275)）。临时表中的 `uTimeString()` ID 会被丢弃。
+3. **外键约束问题**：标签关联表 `_entrytag` 的 `id_entry` 列引用的是 `_entry` 主表的最终 ID。如果在路径②中写入标签关联，关联的 ID 会在 commit 后变成无效引用！
+
+```
+持久化边界：顺序动作链路 ──WRITE──► _entrytmp 临时表
+  (is_read, is_favorite 随 Entry 行一并写入)
+  
+  commitNewEntries() 之后：
+  _entrytmp 数据 → _entry 主表（ID 被重分配！）
+  
+  🔴 如果此链路尝试写入 _entrytag：
+  → _entrytag.id_entry 引用的是临时 ID
+  → commit 后临时 ID 失效 → 关联断裂！
+```
+
+---
+
+#### 9.4.3 路径③：标签独立链路（Tag 打标签）
+
+**触发时机**：所有 Feed 刷新完成，`commitNewEntries()` 将 `_entrytmp` 数据提交到 `_entry` 主表**之后**，由 `applyLabelActions()` 批量执行。
+
+精确调用栈：[feedController.php#L903-L912](file:///d:/fz/0601-1/solo-dogfeeding/code/24-FreshRSS/app/Controllers/feedController.php#L903-L912)
+```
+actualizeFeedsAndCommit()
+  → actualizeFeeds()
+      ↳ 路径② 顺序动作链路执行完毕
+      ↳ 所有新条目写入 _entrytmp 临时表
+  → commitNewEntries()
+      ↳ _entrytmp → _entry 主表（ID 重分配完毕！）
+      ↳ 🔵 applyLabelActions($nbNewEntries)  ← 路径③ 在此触发
+```
+
+**执行动作**：
+
+| 步骤 | 操作 | 代码位置 |
+|------|------|---------|
+| 1 | 从 `FreshRSS_Context::labels()` 获取所有标签 | [feedController.php#L881](file:///d:/fz/0601-1/solo-dogfeeding/code/24-FreshRSS/app/Controllers/feedController.php#L881) |
+| 2 | 过滤出配置了 `label` 动作的 Tag（`filtersAction('label')` 非空） | [feedController.php#L882](file:///d:/fz/0601-1/solo-dogfeeding/code/24-FreshRSS/app/Controllers/feedController.php#L882) |
+| 3 | 从主表 `_entry` 查询最近 N 条新条目（已分配最终 ID） | [feedController.php#L889](file:///d:/fz/0601-1/solo-dogfeeding/code/24-FreshRSS/app/Controllers/feedController.php#L889) |
+| 4 | 嵌套循环：外层遍历 entry，内层遍历 Tag，调用 `Tag::applyFilterActions(entry, &$applyLabel)` | [feedController.php#L889-L901](file:///d:/fz/0601-1/solo-dogfeeding/code/24-FreshRSS/app/Controllers/feedController.php#L889-L901) |
+| 5 | 收集 `(id_tag, id_entry)` 对，使用**主表的最终 ID** | [feedController.php#L893-L896](file:///d:/fz/0601-1/solo-dogfeeding/code/24-FreshRSS/app/Controllers/feedController.php#L893-L896) |
+| 6 | 批量 INSERT 到 `_entrytag` 关联表 | [TagDAO.php#L330-L350](file:///d:/fz/0601-1/solo-dogfeeding/code/24-FreshRSS/app/Models/TagDAO.php#L330-L350) |
+
+**持久化边界**：
+
+路径③独立出来的核心价值是**确保 `_entrytag.id_entry` 引用的是 `_entry` 主表中稳定的最终 ID**，而不是临时表中会被丢弃的 ID。
+
+```
+持久化边界：标签独立链路 ──WRITE──► _entrytag 关联表
+  (引用 _entry 主表的最终 ID，确保外键有效)
+
+  顺序：
+  ① commitNewEntries() → _entry 主表写入完成，ID 稳定
+  ② 从 _entry 读取新条目（拿到最终 ID）
+  ③ 匹配 Tag 规则
+  ④ INSERT _entrytag(id_tag, id_entry) ← id_entry 有效！
+```
+
+---
+
+#### 9.4.4 三条路径的对比总表
+
+| 维度 | 路径①：用户搜索 | 路径②：顺序动作链路 | 路径③：标签独立链路 |
+|------|--------------|-------------------|-------------------|
+| **触发时机** | 用户主动发起搜索请求 | Feed刷新，条目写入临时表前 | commitNewEntries 之后，主表 ID 稳定 |
+| **匹配引擎** | 数据库 SQL 引擎 | PHP 内存 `Entry::matches()` | PHP 内存 `Entry::matches()` |
+| **处理动作** | 无（纯筛选） | `read`（User/Category/Feed）、`star`（仅 User） | `label`（仅 Tag） |
+| **搜索条件来源** | HTTP `search` 参数 | User/Category/Feed 的 `attributes.filters` | Tag 的 `attributes.filters` |
+| **匹配粒度** | 批量 SQL 查询 | 逐条（单条 entry 遍历 3 层级） | 批量嵌套循环（N entry × M Tag） |
+| **Entry ID 状态** | 主表已有稳定 ID | 临时 ID（uTimeString，会被重分配） | 主表最终稳定 ID（@rank 分配完毕） |
+| **写入目标表** | 无（只读） | `_entrytmp` 临时表（is_read, is_favorite 列） | `_entrytag` 关联表 |
+| **调用参数** | — | 未传 `&$applyLabel` 引用 | 传 `&$applyLabel` 引用 |
+| **与 Entry 关系** | 读取已有记录 | 修改 Entry 对象自身属性 | 通过外键关联独立表 |
+
+**架构设计结论**：三条路径的分离不是实现细节，而是由**关系型数据模型**决定的必然结果。Entry 自身的字段（is_read、is_favorite）可以随 Entry 行一并写入，而跨表的关联数据（_entrytag）必须等到主表记录落地、ID 稳定后才能建立关联。
 
 ---
 
