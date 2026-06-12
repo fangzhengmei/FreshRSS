@@ -14,6 +14,7 @@
 | 分类 DAO | [CategoryDAO.php](file:///d:/fz/0601-1/solo-dogfeeding/code/26-FreshRSS/app/Models/CategoryDAO.php) | 分类增删改查、默认分类管理 |
 | 文章 DAO | [EntryDAO.php](file:///d:/fz/0601-1/solo-dogfeeding/code/26-FreshRSS/app/Models/EntryDAO.php) | 文章增删改查、按 GUID 查重 |
 | 标签 DAO | [TagDAO.php](file:///d:/fz/0601-1/solo-dogfeeding/code/26-FreshRSS/app/Models/TagDAO.php) | 标签管理、文章标签关联 |
+| 文章模型 | [Entry.php](file:///d:/fz/0601-1/solo-dogfeeding/code/26-FreshRSS/app/Models/Entry.php) | `toGReader()` 导出格式生成、标签/固有 tags 存储 |
 
 ### 入口点
 
@@ -134,84 +135,224 @@ Web 端受限制，达上限后记录警告并停止创建；CLI 模式（`Fresh
 
 ---
 
-## 三、文章数据导入流程
+## 三、文章导出：分类标签与文章标签的写入位置
 
-### 3.1 文章导入入口
+文章通过 `FreshRSS_Entry::toGReader()` [L1219-L1319](file:///d:/fz/0601-1/solo-dogfeeding/code/26-FreshRSS/app/Models/Entry.php#L1219-L1319) 方法导出为 Google Reader 兼容 JSON 格式。该方法通过 `$mode` 参数区分导出模式，不同模式下写入内容有差异。
 
-`importExportController::importJson()` [L331-L592](file:///d:/fz/0601-1/solo-dogfeeding/code/26-FreshRSS/app/Controllers/importExportController.php#L331-L592) 处理 JSON 格式文章导入（Google Reader 兼容格式）。
+### 3.1 `categories` 数组中写入的四类信息
 
-导入分三个阶段：
-1. **准备阶段**：解析 JSON → 识别文章所属订阅 → 查找/创建对应订阅
-2. **导入阶段**：按 GUID 查重 → 新增或更新文章 → 事务提交
-3. **标签阶段**：解析文章标签 → 创建缺失标签 → 建立文章-标签关联
+所有"分类/标签/状态"相关信息**全部写入文章的 `categories` 数组**，用前缀区分语义：
 
-### 3.2 来源订阅补充机制
+| 类别 | 写入格式 | 代码位置 | 说明 |
+|------|----------|----------|------|
+| **系统状态** | `user/-/state/com.google/reading-list` 等 | L1242, L1305-L1311 | 阅读列表、已读/未读、星标等 |
+| **订阅优先级状态** | `user/-/state/org.freshrss/important` 等 | L1274-L1280 | main / important / hidden |
+| **订阅所属分类名** | `user/-/label/分类名` | L1262-L1264 | **仅非 `freshrss` 模式写入** |
+| **用户给文章打的标签（Label）** | `user/-/label/标签名` | L1312-L1314 | 由 `$labels` 参数传入，来自 `_tag` + `_entrytag` |
+| **文章固有 tags** | 直接写入字符串，无前缀 | L1315-L1317 | 来自 `_entry.tags` 字段，`$this->tags()` 返回 |
 
-文章通过 `origin` 字段关联到订阅，处理逻辑在 `importJson()` [L356-L412](file:///d:/fz/0601-1/solo-dogfeeding/code/26-FreshRSS/app/Controllers/importExportController.php#L356-L412)：
+> **⚠️ 极其重要：订阅所属分类名与用户文章标签（Label）使用相同的 `user/-/label/` 前缀，在 JSON 中无法区分来源。**
 
-#### 订阅 URL 获取优先级
-1. `origin.feedUrl` → 直接使用
-2. `origin.streamId`（`feed/` 前缀）→ 去掉前缀取 URL
-3. `origin.htmlUrl` → 用网站 URL 代替
-4. 都没有 → 使用占位 URL `http://import.localhost/import.xml` 并标记禁用
+### 3.2 `origin` 对象中写入的订阅信息
 
-#### 订阅查找与创建
-- 先用 `searchByUrl()` 在数据库查找
-- 不存在则调用 `addFeedJson()` 创建
-- 创建时使用 origin 中的 `title`（默认 "Import"）、`htmlUrl`、`category` 等信息
-- 分类从 `origin.category` 获取，没有则用默认分类
+`origin` 对象存储文章所属订阅的来源信息，不同模式写入不同字段：
 
-> **设计意图**：即使没有 OPML 文件，仅导入文章 JSON 也能自动补建对应的订阅记录，确保文章都有归属。
+| 字段 | 写入条件 | 代码位置 | 内容 |
+|------|----------|----------|------|
+| `streamId` | 始终写入 | L1245 | `'feed/' + feedId`，但 feedId 是数据库自增 ID，跨实例不可用 |
+| `htmlUrl` | feed 不为 null | L1266 | 订阅的网站 URL |
+| `title` | feed 不为 null | L1267 | 订阅名称 |
+| `feedUrl` | **仅 `mode === 'freshrss'`** | L1271 | **订阅的 RSS/ATOM URL，是重新匹配订阅的关键** |
 
-### 3.3 星标信息入库
+> **⚠️ 关键差异：`feedUrl` 只在 `freshrss` 模式下才写入 origin。非 `freshrss` 模式（兼容模式）导出时，origin 里没有订阅 URL。**
 
-星标状态从文章的 `categories` 数组中解析 [L453-L469](file:///d:/fz/0601-1/solo-dogfeeding/code/26-FreshRSS/app/Controllers/importExportController.php#L453-L469)：
+### 3.3 `origin.category` 的缺失
 
-- 匹配 `user/-/state/com.google/starred` → `is_starred = true`
-- 匹配 `user/-/state/com.google/read` → `is_read = true`
-- 匹配 `user/-/state/com.google/unread` → `is_read = false`
+`importExportController::addFeedJson()` [L619](file:///d:/fz/0601-1/solo-dogfeeding/code/26-FreshRSS/app/Controllers/importExportController.php#L619) 在创建订阅时会尝试读取 `$origin['category']`，但：
 
-星标是文章的固有属性，存储在 `_entry` 表的 `is_favorite` 字段中。
+- **`toGReader()` 从不把分类名写入 `origin.category` 字段**
+- 分类名只出现在 `categories` 数组中（`user/-/label/分类名` 格式）
+- 导入时 `categories` 数组中 `user/-/label/` 前缀的内容**全部被当作文章标签（Label）处理**，不会作为订阅分类
 
-### 3.4 标签（Label）信息入库
+> **推论：FreshRSS 自导出的文章 JSON 在重新导入时，如果不配合 OPML 文件，订阅分类信息会丢失，新建的订阅会进入默认分类。**
 
-标签也从 `categories` 数组解析，匹配 `user/-/label/` 前缀 [L459-L461](file:///d:/fz/0601-1/solo-dogfeeding/code/26-FreshRSS/app/Controllers/importExportController.php#L459-L461)：
+### 3.4 导出模式对比
 
-#### 处理流程
-1. 遍历文章时收集 `labelName → [articles]` 映射
-2. 文章导入完成后，在独立事务中处理标签关联
-3. 标签不存在则调用 `tagDAO->addTag()` 创建
-4. 通过 `_entrytag` 关联表建立文章与标签的多对多关系
-5. 关联使用 `INSERT IGNORE` 避免重复报错
+| 模式 | 适用场景 | `origin.feedUrl` | 分类名写入 categories | `guid` 字段 |
+|------|----------|-------------------|----------------------|-------------|
+| `freshrss` | FreshRSS 内部导入导出 | ✅ 写入 | ❌ 不写入 | ✅ 写入 |
+| `compat` | 兼容外部阅读器 | ❌ 不写入 | ✅ 写入（作为 label） | ❌ 不写入 |
+| 空字符串 | 默认/API 调用 | ❌ 不写入 | ✅ 写入（作为 label） | ❌ 不写入 |
 
-#### 标签与分类的区别
-| 维度 | 分类 (Category) | 标签 (Tag/Label) |
-|------|-----------------|------------------|
-| 层级 | 一级结构，每个订阅属于一个分类 | 扁平结构，每篇文章可有多个标签 |
-| 存储 | `_category` 表 + `_feed.category` 字段 | `_tag` 表 + `_entrytag` 关联表 |
-| OPML 中 | 以 outline 嵌套结构表示 | 以 `frss:label` 命名空间属性表示 |
-
-### 3.5 文章重复处理（GUID 维度）
-
-文章按 **GUID** 去重，逻辑在 `importJson()` [L521-L550](file:///d:/fz/0601-1/solo-dogfeeding/code/26-FreshRSS/app/Controllers/importExportController.php#L521-L550)：
-
-1. 先批量查询每个订阅下已存在的 GUID 哈希（`listHashForFeedGuids`）
-2. 导入时检查：存在 → 更新文章，不存在 → 新增文章
-3. 同一导入批次内也通过 `$newGuids` 数组去重，避免同一文件内重复
-
-### 3.6 事务与性能
-
-文章导入使用多段事务：
-1. 第一段事务：批量插入/更新文章
-2. `commitNewEntries()`：提交新文章的二级索引
-3. `updateCachedValues()`：更新订阅缓存计数
-4. 第二段事务：批量建立标签关联
+在 `ExportService` 中：
+- `generateStarredEntries()` 和 `generateFeedEntries()` 均调用 `toGReader('freshrss')` → 写入 `feedUrl`，**不写入分类名到 categories**
 
 ---
 
-## 四、导出流程详解
+## 四、文章导入：如何从来源信息找回原订阅
 
-### 4.1 OPML 订阅导出
+### 4.1 订阅 URL 获取链路
+
+`importExportController::importJson()` [L372-L383](file:///d:/fz/0601-1/solo-dogfeeding/code/26-FreshRSS/app/Controllers/importExportController.php#L372-L383) 按以下优先级获取订阅 URL：
+
+```
+优先级 1：origin.feedUrl            ← 仅 freshrss 模式导出时有
+优先级 2：origin.streamId（去 feed/ 前缀） ← Google Reader 兼容格式，通常是数字 ID，跨实例无效
+优先级 3：origin.htmlUrl            ← 网站 URL，可能不是 feed URL
+兜底   ：http://import.localhost/import.xml（标记禁用）
+```
+
+**重新匹配成功的关键**：导出时必须使用 `freshrss` 模式（已写入 `origin.feedUrl`），或者 OPML 文件已先导入创建了订阅。
+
+### 4.2 订阅查找与创建流程
+
+```
+遍历每篇文章
+    ↓
+从 origin 提取 feedUrl（如上优先级）
+    ↓
+searchByUrl(feedUrl) 在数据库查找订阅
+    ↓
+    ├─ 找到 → 使用该订阅 ID 关联文章
+    └─ 找不到 → 调用 addFeedJson(origin) 补建订阅
+                    ↓
+                    addFeedJson 内部：
+                    ├─ URL 取 origin.feedUrl 或 origin.htmlUrl
+                    ├─ 分类名取 origin.category（通常为空，因为导出时没写）
+                    │   └─ 为空则使用默认分类
+                    ├─ 名称取 origin.title（默认 "Import"）
+                    └─ 调用 addFeedObject() 入库（内部再次按 URL 查重）
+```
+
+### 4.3 `addFeedJson()` 分类处理的细节
+
+`addFeedJson()` [L618-L623](file:///d:/fz/0601-1/solo-dogfeeding/code/26-FreshRSS/app/Controllers/importExportController.php#L618-L623)：
+
+```php
+$cat_id = FreshRSS_CategoryDAO::DEFAULTCATEGORYID;
+$cat_name = trim($origin['category'] ?? '');
+if ($cat_name !== '') {
+    $new_cat = $this->categoryDAO->searchByName($cat_name);
+    $cat_id = $new_cat?->id() ?: $this->categoryDAO->addCategory(['name' => $cat_name]) ?: DEFAULTCATEGORYID;
+}
+```
+
+- 由于 `toGReader()` 从不写入 `origin.category`，`$cat_name` 通常为空字符串
+- `$cat_id` 直接取 `DEFAULTCATEGORYID`
+- 除非文章 JSON 来自其他外部系统并正确设置了 `origin.category`，否则**自动补建的订阅全部进入默认分类**
+
+### 4.4 导入时 categories 数组的解析
+
+`importJson()` [L443-L464](file:///d:/fz/0601-1/solo-dogfeeding/code/26-FreshRSS/app/Controllers/importExportController.php#L443-L464) 对 `categories` 数组逐项处理：
+
+```
+遍历 categories 数组中的每个字符串：
+    ↓
+匹配 user/xxx/ 前缀？
+    ├─ 否 → 保留为文章固有 tags（存入 _entry.tags 字段）
+    └─ 是 → 进一步匹配：
+            ├─ state/com.google/starred  → is_starred = true
+            ├─ state/com.google/read     → is_read = true
+            ├─ state/com.google/unread   → is_read = false
+            ├─ label/标签名              → 收集为文章 Label（存入 _tag + _entrytag）
+            └─ 其他（如 state/org.freshrss/important）→ 直接丢弃
+```
+
+**关键点**：
+- `user/-/label/` 前缀的全部当作文章 Label，与订阅分类无关
+- `user/-/state/org.freshrss/main` 等订阅优先级信息在导入时**被丢弃**，不会恢复到订阅上
+- 无前缀的字符串保留为文章固有 tags（如 TT-RSS 的 `tag_cache`）
+
+### 4.5 重新匹配订阅的完整链路
+
+**链路 A：OPML 先导入（推荐，分类信息完整保留）**
+```
+1. 导入 OPML → 分类创建 / 合并 → 订阅创建（带正确分类）
+2. 导入文章 JSON → 从 origin.feedUrl 提取 URL
+3. searchByUrl() 命中 OPML 已创建的订阅
+4. 文章通过 feedId 关联到已有订阅 → 分类正确保留
+```
+
+**链路 B：仅导入文章 JSON（不推荐，分类丢失）**
+```
+1. 导入文章 JSON → 从 origin.feedUrl 提取 URL
+2. searchByUrl() 未命中
+3. addFeedJson() 补建订阅 → origin.category 为空 → 进入默认分类
+4. 文章关联到新建订阅 → 所有订阅在默认分类下
+5. 原分类名以 user/-/label/分类名 形式出现在 categories 数组
+   → 被当作文章 Label 处理 → 每篇文章都打上原分类名作为标签
+```
+
+---
+
+## 五、重复订阅且分类不同：全链路表现
+
+### 5.1 场景定义
+
+- 已有状态：订阅 URL `http://example.com/feed.xml` 存在，属于**分类 A**
+- 导入数据：OPML 中同一 URL 出现在**分类 B** 下，或文章 JSON 的 categories 含 `user/-/label/分类B`
+
+### 5.2 OPML 导入链路的表现
+
+```
+OPML 解析 → 分类 B 下的订阅列表包含该 URL
+    ↓
+循环处理：addFeedObject(url, category=分类B)
+    ↓
+searchByUrl(url) 命中已存在的订阅（在分类 A）
+    ↓
+执行 UPDATE，更新字段不包含 category
+    ↓
+最终结果：
+    ✓ 订阅保留在分类 A（原分类不变）
+    ✓ 订阅的 name / website / attributes 等被 OPML 中的值更新
+    ✗ 分类 B 不会包含该订阅
+    ✗ 不会产生重复订阅记录
+```
+
+### 5.3 文章 JSON 导入链路的表现
+
+```
+文章 categories 含 "user/-/label/分类B"（导出时写入的原分类名）
+    ↓
+从 origin.feedUrl 获取 URL → searchByUrl() 命中分类 A 下的订阅
+    ↓
+文章关联到该订阅（feedId 指向分类 A 的订阅）
+    ↓
+解析 categories：
+    "user/-/label/分类B" → 识别为 Label
+    → 收集到 labels 映射 → 创建/查找 "分类B" 标签 → 建立文章-标签关联
+    ↓
+最终结果：
+    ✓ 文章归入分类 A 下的订阅（因为订阅在分类 A）
+    ✓ 文章额外打上一个叫 "分类B" 的标签（Label）
+    ✗ 订阅本身不会被移动到分类 B
+    ✗ 分类 B 不会被创建为订阅分类（除非 OPML 中有）
+```
+
+### 5.4 数据库层面的最终状态
+
+| 数据 | 存储位置 | 最终值 |
+|------|----------|--------|
+| 订阅分类 | `_feed.category` | 分类 A 的 ID（不变） |
+| 订阅名称等属性 | `_feed` 各字段 | OPML/JSON 中导入的值（覆盖） |
+| 文章所属订阅 | `_entry.id_feed` | 分类 A 下订阅的 ID |
+| "分类B" 这个名称 | `_tag.name` + `_entrytag` | 作为文章标签存在，每篇文章关联 |
+| 分类 B | `_category` 表 | **不会被创建**（除非 OPML 中有其他订阅） |
+
+### 5.5 用户视角的表现
+
+在 FreshRSS UI 中：
+- **订阅列表**：该订阅显示在"分类 A"下，与导入前相同
+- **分类 B 订阅列表**：空，看不到该订阅
+- **文章视图**：每篇文章显示有"分类B"标签（Label），可通过标签过滤器筛选
+- **标签列表**：出现一个名为"分类B"的标签，包含所有从该分类导出的文章
+
+---
+
+## 六、导出流程详解
+
+### 6.1 OPML 订阅导出
 
 `ExportService::generateOpml()` [L46-L56](file:///d:/fz/0601-1/solo-dogfeeding/code/26-FreshRSS/app/Services/ExportService.php#L46-L56)：
 
@@ -229,26 +370,27 @@ FreshRSS 通过 `frss:` 命名空间导出高级配置（命名空间 URI：`htt
 - cURL 参数（cookie、代理、请求头等）
 - 动态 OPML 分类的 `frss:opmlUrl`
 
-### 4.2 文章数据导出
+### 6.2 文章数据导出
 
 #### 星标 / 标签文章
 `ExportService::generateStarredEntries()` [L71-L89](file:///d:/fz/0601-1/solo-dogfeeding/code/26-FreshRSS/app/Services/ExportService.php#L71-L89)：
 - 参数 `S`=仅星标，`T`=仅标签，`ST`=星标或标签
-- 输出 Google Reader 兼容 JSON 格式
+- 调用 `toGReader('freshrss')` → 写入 `feedUrl`，**不写入分类名到 categories**
 - **星标与标签合并在同一个文件**，避免同一篇文章重复出现
 
 #### 指定订阅文章
 `ExportService::generateFeedEntries()` [L96-L124](file:///d:/fz/0601-1/solo-dogfeeding/code/26-FreshRSS/app/Services/ExportService.php#L96-L124)：
 - 每个订阅一个 JSON 文件
 - 默认最多 50 条
+- 同样调用 `toGReader('freshrss')`
 
-### 4.3 OPML 与文章文件的关系
+### 6.3 OPML 与文章文件的关系
 
 > **重要：OPML 文件与文章文件是分别生成的独立文件，不存在内容合并。**
 
 它们的关系是：
 - **结构上独立**：OPML 只含订阅+分类结构；文章 JSON 只含文章数据
-- **通过 origin 关联**：文章 JSON 中的 `origin.feedUrl` / `origin.streamId` 对应 OPML 中的订阅 URL
+- **通过 URL 关联**：文章 JSON 中的 `origin.feedUrl` 对应 OPML 中的订阅 URL（`xmlUrl` 属性）
 - **打包方式**：多个文件统一打包进 ZIP 压缩包
 
 导出文件清单（ZIP 内）：
@@ -260,7 +402,7 @@ freshrss_用户_日期_export.zip
 └─ ...
 ```
 
-### 4.4 多文件 ZIP 打包
+### 6.4 多文件 ZIP 打包
 
 `ExportService::zip()` [L152-L178](file:///d:/fz/0601-1/solo-dogfeeding/code/26-FreshRSS/app/Services/ExportService.php#L152-L178)：
 
@@ -271,47 +413,53 @@ freshrss_用户_日期_export.zip
 
 ---
 
-## 五、关键数据结构
+## 七、关键数据结构
 
-### 5.1 数据库表关系
+### 7.1 数据库表关系
 
 ```
 _category (分类表)
-    └── _feed (订阅表)  ←─ category 外键
-            └── _entry (文章表)  ←─ id_feed 外键
-                    └── _entrytag (文章标签关联表)
-                            └── _tag (标签表)
+    └── _feed (订阅表)  ←─ category 外键（每个订阅属于一个分类）
+            └── _entry (文章表)  ←─ id_feed 外键（每篇文章属于一个订阅）
+                    ├── is_favorite 字段  ←─ 星标状态
+                    ├── tags 字段         ←─ 文章固有 tags（字符串数组）
+                    └── _entrytag (关联表) ←─ 多对多
+                            └── _tag (标签表)  ←─ 用户打的 Label
 ```
 
-### 5.2 导出的 JSON 文章格式（Google Reader 兼容）
+### 7.2 导出的 JSON 文章格式（Google Reader 兼容）
 
 每篇文章的关键字段：
 ```json
 {
   "id": "tag:google.com,2005:reader/item/...",
-  "guid": "文章唯一标识",
+  "frss:id": "FreshRSS内部文章ID",
+  "guid": "文章唯一标识（仅freshrss模式）",
   "title": "标题",
   "published": "时间戳",
   "content": { "content": "HTML内容" },
   "alternate": [{ "href": "文章链接" }],
   "origin": {
-    "streamId": "feed/订阅ID",
-    "feedUrl": "订阅URL",
+    "streamId": "feed/订阅数据库ID",
+    "title": "订阅名称",
     "htmlUrl": "网站URL",
-    "title": "订阅名称"
+    "feedUrl": "订阅URL（仅freshrss模式，重新匹配的关键）"
   },
   "categories": [
     "user/-/state/com.google/reading-list",
     "user/-/state/com.google/starred",
-    "user/-/label/标签名",
-    "user/-/state/org.freshrss/important"
+    "user/-/state/com.google/read",
+    "user/-/state/org.freshrss/important",
+    "user/-/label/订阅分类名（非freshrss模式）",
+    "user/-/label/用户文章标签名",
+    "文章固有tags（无前缀）"
   ]
 }
 ```
 
 ---
 
-## 六、核心代码路径速查
+## 八、核心代码路径速查
 
 ### OPML 订阅导入路径
 ```
@@ -329,7 +477,7 @@ importFile()
                 └─ FeedDAO::addFeedObject()
                     ├─ searchByUrl() 按 URL 查重
                     ├─ 不存在 → addFeed() 新建（带分类）
-                    └─ 已存在 → 更新字段（分类不变）+ 合并 attributes
+                    └─ 已存在 → 更新字段（category 不变）+ 合并 attributes
 ```
 
 ### 文章导入路径
@@ -337,13 +485,34 @@ importFile()
 importFile()
     └─ JSON 文章导入 → importJson()
         ├─ 解析 JSON 文章列表
-        ├─ 遍历文章：从 origin 提取 feedUrl
+        ├─ 遍历文章：从 origin 提取 feedUrl（优先级：feedUrl > streamId > htmlUrl）
         │   ├─ searchByUrl() 查找订阅
-        │   └─ 不存在则 addFeedJson() 补建订阅
+        │   └─ 不存在则 addFeedJson() 补建订阅（origin.category 为空 → 默认分类）
+        ├─ 解析 categories 数组：
+        │   ├─ state/com.google/* → is_starred / is_read
+        │   ├─ label/* → 文章 Label（通过 _tag + _entrytag）
+        │   └─ 其他无前缀 → 文章固有 tags（存入 _entry.tags）
         ├─ 按 GUID 批量查重
         ├─ 事务1：批量插入/更新文章
         ├─ commitNewEntries() + 更新缓存
-        └─ 事务2：解析标签 + tagEntry() 建立关联
+        └─ 事务2：tagEntry() 批量建立文章-标签关联
+```
+
+### 文章导出路径
+```
+ExportService::generateStarredEntries() / generateFeedEntries()
+    ↓
+FreshRSS_Entry::toGReader('freshrss')
+    ├─ origin.feedUrl → 写入（重新匹配的关键）
+    ├─ origin.streamId / htmlUrl / title → 写入
+    ├─ origin.category → ❌ 不写入
+    ├─ categories：
+    │   ├─ state/com.google/* → 星标/已读状态
+    │   ├─ state/org.freshrss/* → 订阅优先级
+    │   ├─ user/-/label/分类名 → ❌ freshrss 模式不写入
+    │   ├─ user/-/label/标签名 → 写入（用户 Label）
+    │   └─ 无前缀 → 写入（文章固有 tags）
+    └─ guid → 写入（freshrss 模式）
 ```
 
 ### 导出路径
@@ -359,7 +528,9 @@ ExportService
 
 ---
 
-## 七、关键设计特点总结
+## 九、关键设计特点与潜在问题总结
+
+### 9.1 设计特点
 
 1. **名称匹配的分类合并**：分类按名称精确匹配，同名直接复用，保证导入不产生重复分类
 
@@ -380,3 +551,31 @@ ExportService
 9. **FreshRSS 扩展命名空间**：`frss:` 命名空间导出高级配置，与标准 OPML 兼容
 
 10. **多段事务设计**：文章导入分多段事务，平衡数据一致性与性能
+
+### 9.2 已知的链路特性（非 Bug，是设计选择）
+
+| 特性 | 表现 | 影响场景 |
+|------|------|----------|
+| **分类名与文章 Label 格式相同** | 都使用 `user/-/label/` 前缀，导入时无法区分 | 仅导入文章 JSON 时，原分类名变成每篇文章的 Label |
+| **`origin.category` 从未写入** | `toGReader()` 不输出该字段 | 仅导入文章 JSON 时，自动补建的订阅全部进入默认分类 |
+| **重复订阅不迁移分类** | `addFeedObject()` UPDATE 不包含 category 字段 | 同一 URL 在不同分类的 OPML 中出现时，保留首次导入的分类 |
+| **订阅优先级导入时丢失** | `categories` 中 `state/org.freshrss/*` 在导入时被丢弃 | 文章导入不会恢复订阅的 main/important/hidden 优先级 |
+| **`freshrss` 模式不写分类名** | `mode !== 'freshrss'` 才写入 `user/-/label/分类名` | 自导出文章 JSON 不含分类名信息 |
+| **`streamId` 是数据库自增 ID** | `'feed/' + feedId` 跨实例不匹配 | 跨实例迁移时 streamId 无用，必须依赖 `origin.feedUrl` |
+
+### 9.3 正确的导出+导入流程（完整保留所有信息）
+
+```
+导出：
+    1. 勾选 OPML（订阅+分类结构）
+    2. 勾选星标/标签文章
+    3. 勾选需要导出的订阅文章
+    → 生成 ZIP 包
+
+导入（按内置顺序自动执行）：
+    1. OPML 先导入 → 分类创建/合并 + 订阅创建（带正确分类）
+    2. 星标文章 JSON → 按 origin.feedUrl 命中已有订阅 → 文章关联正确
+    3. 订阅文章 JSON → 同上
+```
+
+如果跳过 OPML 仅导入文章 JSON，分类信息会降级为文章 Label，订阅进入默认分类。
