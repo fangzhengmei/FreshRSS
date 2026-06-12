@@ -108,6 +108,8 @@ WHERE ...
 
 可选按 `catId` 或 `feedId` 限定重算范围。**这是列表页侧栏、标题栏未读数与数据库保持一致的关键机制**——所有写操作最终都会触达它。
 
+> **关键差异伏笔**：`markFavorite()` 没有对应的 `updateCacheFavorites()` 方法，因为 `_feed` 表根本没有 `cache_nbFavorites` 字段。收藏的总数和未读数在每次页面加载时通过 `COUNT(*)` 实时计算。
+
 ---
 
 ## 三、控制器层（Controller）
@@ -146,20 +148,32 @@ WHERE ...
 位置：[entryController.php L232-L246](file:///d:/fz/0601-1/solo-dogfeeding/code/23-FreshRSS/app/Controllers/entryController.php#L232-L246)
 
 逻辑相对简单：
-- 参数 `id`（必须数字字符串）、`is_favorite`（缺省 true）
-- 调用 `$entryDAO->markFavorite($id, $is_favourite)`
-- 非 AJAX → forward 到 index
-- AJAX → 渲染 [entry/bookmark.phtml](file:///d:/fz/0601-1/solo-dogfeeding/code/23-FreshRSS/app/views/entry/bookmark.phtml)，返回 JSON：
-  ```json
-  { "url": ".../?c=entry&a=bookmark&id=X&is_favorite=0", "icon": "<svg>...</svg>" }
-  ```
-  即告诉前端"反向切换"所需的新 URL 和新图标 HTML。
+
+```php
+public function bookmarkAction(): void {
+    $id = Minz_Request::paramString('id', plaintext: true);
+    $is_favourite = Minz_Request::paramTernary('is_favorite') ?? true;
+    if ($id != '' && ctype_digit($id)) {
+        $entryDAO = FreshRSS_Factory::createEntryDao();
+        $entryDAO->markFavorite($id, $is_favourite);
+    }
+    if (!$this->ajax) {
+        Minz_Request::forward(['c' => 'index', 'a' => 'index'], true);
+    }
+}
+```
+
+关键特征：
+- **单篇限定**：`paramString` + `ctype_digit($id)` 强校验，确保是单个数字 ID。不接受数组（不像 `readAction` 用 `paramArrayString`）
+- **无范围路由**：没有 `get` 参数分支，不支持分类 / Feed / 标签范围批量
+- **无过滤透传**：没有 `state` / `search` / `idMax` 等过滤参数
+- **响应简洁**：AJAX 模式下渲染 [entry/bookmark.phtml](file:///d:/fz/0601-1/solo-dogfeeding/code/23-FreshRSS/app/views/entry/bookmark.phtml)，返回 JSON `{ url, icon }` —— 即告诉前端"下一次反向切换"需要的 URL 和图标 HTML
 
 ---
 
 ## 四、视图渲染层：列表回显
 
-条目状态通过 View 层 **三处重复渲染**，但都使用同一套数据来源，保证一致性。
+条目状态通过 View 层 **多处重复渲染**，但都使用同一套数据来源，保证一致性。
 
 ### 4.1 渲染源头：`FreshRSS_Entry::isRead() / isFavorite()`
 
@@ -168,7 +182,20 @@ WHERE ...
 - 若已读 → 链接 URL 带 `&is_read=0`（点击后标记为未读），图标为 `read`
 - 收藏同理，切换 `is_favorite` 参数和 `starred / non-starred` 图标
 
-### 4.2 列表头部按钮：`entry_header.phtml`
+### 4.2 列表条目容器：class 与状态绑定
+
+列表中每条文章的根 `<div>` 就把状态编码到 class 中，这是 CSS 样式和 JS 交互的共同基础：
+
+[normal.phtml L79-L82](file:///d:/fz/0601-1/solo-dogfeeding/code/23-FreshRSS/app/views/index/normal.phtml#L79-L82)：
+```php
+<div class="flux<?= !$this->entry->isRead() ? ' not_read' : ''
+    ?><?= $this->entry->isFavorite() ? ' favorite' : ''
+    ?>" id="flux_<?= $this->entry->id() ?>">
+```
+
+`not_read` class 控制未读高亮，`favorite` class 控制收藏高亮。两者互不干扰，独立切换。
+
+### 4.3 列表头部按钮：`entry_header.phtml`
 
 [entry_header.phtml](file:///d:/fz/0601-1/solo-dogfeeding/code/23-FreshRSS/app/views/helpers/index/normal/entry_header.phtml#L30-L49) 渲染 Normal 视图每条顶部的读/收藏按钮：
 
@@ -184,25 +211,29 @@ if ($this->entry->isRead()) {
 
 收藏按钮完全类似（L40-L48），class 为 `bookmark`。
 
-### 4.3 列表底部按钮：`entry_bottom.phtml`
+### 4.4 列表底部按钮：`entry_bottom.phtml`
 
 [entry_bottom.phtml](file:///d:/fz/0601-1/solo-dogfeeding/code/23-FreshRSS/app/views/helpers/index/normal/entry_bottom.phtml#L16-L35) 代码结构与 header 完全一致，class 同样为 `read` / `bookmark`。
 
-### 4.4 阅读视图：`article.phtml`
+### 4.5 阅读视图：`article.phtml`
 
 [article.phtml](file:///d:/fz/0601-1/solo-dogfeeding/code/23-FreshRSS/app/views/helpers/index/article.phtml#L15-L34) 在 Reader 视图的顶部、副标题、底部共三处渲染按钮，所有 `<a>` 都标记同一 class `read` / `bookmark`。
 
-### 4.5 批量操作入口：`stream-footer.phtml`
+### 4.6 批量操作入口：`stream-footer.phtml`
 
 [stream-footer.phtml](file:///d:/fz/0601-1/solo-dogfeeding/code/23-FreshRSS/app/views/helpers/stream-footer.phtml#L13-L27) 渲染"全部标为已读"大按钮，其 `formaction` URL 将当前 `get / nextGet / idMax / search / state / sort / order` 全部打包提交给 `entry/readAction()`。
 
-### 4.6 前端注入 JS 上下文：`javascript_vars.phtml`
+> **重要差异**：stream-footer 只有"全部标已读"按钮，**没有对应的"全部收藏"或"全部取消收藏"按钮**。收藏在列表底部没有批量入口。
+
+### 4.7 前端注入 JS 上下文：`javascript_vars.phtml`
 
 [javascript_vars.phtml](file:///d:/fz/0601-1/solo-dogfeeding/code/23-FreshRSS/app/views/helpers/javascript_vars.phtml#L8-L101) 输出 JSON：
 - `context.auto_mark_article / scroll / focus / site` —— 四种自动标读触发开关
 - `context.csrf` —— AJAX 请求 token
 - `context.icons.read / unread / spinner` —— 图标资源 URL
 - `shortcuts.mark_read / mark_favorite` —— 键盘快捷键
+
+> 注意：只有 `auto_mark_*` 四种自动标读开关，**没有自动收藏开关**。收藏不参与"自动触发"体系。
 
 ---
 
@@ -264,18 +295,19 @@ Body: { ajax: true, _csrf, id: [ids...] }
 
 位置：[main.js L360-L440](file:///d:/fz/0601-1/solo-dogfeeding/code/23-FreshRSS/p/scripts/main.js#L360-L440)
 
-流程与 `mark_read` 对称但使用 XMLHttpRequest（未走 fetch queue）：
+流程与 `mark_read` 对称但存在关键差异：
 
 1. 同样 `pending_entries` 防重 + spinner 临时图标
-2. POST 到 `<a.bookmark>.href`（服务端动态生成的 URL 已决定方向）
-3. 响应 JSON 包含 `url`（反向切换用的新 URL）和 `icon`（新图标 HTML）
-4. 成功时：
+2. **使用 XMLHttpRequest 而非 fetch** —— 代码演化遗留，功能等价但风格不统一
+3. POST 到 `<a.bookmark>.href`（服务端动态生成的 URL 已决定方向）
+4. 响应 JSON 包含 `url`（反向切换用的新 URL）和 `icon`（新图标 HTML）
+5. 成功时：
    - `div.classList.toggle('favorite')`
-   - `div.querySelectorAll('a.bookmark').href = json.url`
-   - `div.querySelectorAll('a.bookmark > .icon').outerHTML = json.icon`
-   - 侧栏收藏夹计数 `incLabel()` ±1
-   - 若文章未读，同步更新 favorites 伪分类的未读数
-5. 失败回滚：恢复 `originalIcon.src/alt`
+   - `div.querySelectorAll('a.bookmark').forEach(a => a.href = json.url)` —— 全量替换所有收藏链接的 href
+   - `div.querySelectorAll('a.bookmark > .icon').forEach(img => img.outerHTML = json.icon)` —— 全量替换所有图标
+   - 侧栏收藏夹计数：`favourites.textContent.replace(..., incLabel(p1, inc, false))` —— 对括号内的数字 ±1
+   - 若文章未读，同步更新 favorites 伪分类的 `data-unread` 属性
+6. 失败回滚：恢复 `originalIcon.src/alt`
 
 ### 5.4 四类"自动标读"触发
 
@@ -288,46 +320,253 @@ Body: { ajax: true, _csrf, id: [ids...] }
 | 滚动出屏 | [main.js L902-L915](file:///d:/fz/0601-1/solo-dogfeeding/code/23-FreshRSS/p/scripts/main.js#L902-L915) `onScroll()` | `context.auto_mark_scroll` (`mark_when.scroll`) |
 | 点击原网站 | [main.js L1320-L1329](file:///d:/fz/0601-1/solo-dogfeeding/code/23-FreshRSS/p/scripts/main.js#L1320-L1329) 快捷键 | `context.auto_mark_site` (`mark_when.site`) |
 
+> 收藏没有任何"自动触发"机制。收藏是纯用户主动行为。
+
 ### 5.5 批量标读：`mark_previous_read()`
 
 [main.js L353-L358](file:///d:/fz/0601-1/solo-dogfeeding/code/23-FreshRSS/p/scripts/main.js#L353-L358)：快捷键 Alt+mark_read 触发，从当前文章向前遍历 `previousElementSibling`，逐条 `mark_read(div, true, true)` 全部入队列，由 debounce 合并为一次请求。
 
----
-
-## 六、一致性保障机制总览
-
-从用户点击 → UI 反馈 → 数据库 → 列表回显，多层机制共同保障单篇、批量、列表显示的一致性：
-
-### 6.1 数据库层面
-- **单篇原子 UPDATE**：`markRead(string)` 用 JOIN 同时写 entry 和 feed.cache_nbUnreads，杜绝"状态写了但缓存没更"的中间态
-- **批量重算缓存**：`markRead(array/entries/cat/feed/tag)` 后调用 `updateCacheUnreads()`，用 `COUNT(*)` 从真实数据重算，避免算术累计误差
-- **条件写防止重复**：`WHERE is_read<>?` 保证幂等，重复请求不会乱改缓存
-- **lastUserModified 同步更新**：每次改状态都写此时间戳，供客户端增量同步
-
-### 6.2 后端接口层面
-- **单篇 / 批量共用 DAO 方法**：`markRead($ids, $is_read)` 不管传 string 还是 array，最终写库逻辑一致
-- **过滤条件透传**：批量标读时把 `state`（读/收藏筛选）和 `search`（布尔搜索）一并传给 DAO，前端"当前筛选下全部标读"与 DB 精确匹配
-- **响应携带辅助数据**：read 响应返回标签与条目映射，bookmark 响应返回下一次切换所需的 URL + 图标，前端无需自行推断
-
-### 6.3 前端 UI 层面
-- **单事件委托**：所有 `.read` / `.bookmark` 链接（header / bottom / reader 视图）都绑定到同一 `mark_read` / `mark_favorite` 函数，行为完全统一
-- **pending_entries 锁**：请求往返期间阻止重复点击
-- **先 spinner 后真实切换**：用户操作得到即时视觉反馈，但真正的 class / URL / icon 切换只在服务器成功响应后执行（非乐观更新，避免状态回滚闪烁）
-- **失败自动回滚**：HTTP 错误时把 spinner 换回原图标，class 不变
-- **队列 + debounce**：自动标读（滚动 / 焦点 / 打开文章）1 秒窗口内合并为单次 HTTP，既减少请求数又避免逐条来回导致的闪烁
-- **侧栏 / 标题 / favicon 联动**：`incUnreadsFeed()` 和 `incUnreadsTag()` 统一维护所有显示未读数的 DOM 节点，不依赖页面刷新
-- **批量入口复用 URL 参数**：stream-footer 的 Mark all as read 按钮把当前 `get/state/search/idMax` 原样提交，后端使用与列表查询相同的过滤条件
-
-### 6.4 视图渲染层面
-- **单一数据源**：三套模板（entry_header / entry_bottom / article）都从 `$this->entry->isRead()` 和 `$this->entry->isFavorite()` 取状态，URL 生成逻辑在各模板中逐字相同，页面刷新时必然一致
-- **class 语义化**：`not_read` 控制未读样式、`favorite` 控制收藏高亮，JS 与 CSS 共用相同 class 名，减少状态分叉
-- **JS 上下文注入**：`javascript_vars.phtml` 把 PHP 配置（自动标读开关、快捷键、图标 URL）透传前端，前后端行为参数同源
+> 收藏没有对应的"批量收藏前面 N 篇"的快捷键或功能。
 
 ---
 
-## 七、完整调用链汇总
+## 六、收藏与阅读状态的批量路径深度对比
 
-### 7.1 单篇切换已读
+这是两类状态切换中**最关键的差异**：底层 DAO 都支持数组批量写入，但上层 Web UI 对收藏的批量入口是**缺失的**。以下从五层逐一拆解。
+
+### 6.1 DAO 层：都支持数组，但优化深度不同
+
+#### `markRead()` 的数组路径 —— 三层策略
+
+[EntryDAO.php L499-L570](file:///d:/fz/0601-1/solo-dogfeeding/code/23-FreshRSS/app/Models/EntryDAO.php#L499-L570) 根据数量走三种策略：
+
+| 数量范围 | 策略 | 原因 |
+|---------|------|------|
+| 1~5 篇 | 循环调用单篇路径（`markRead(string)`） | 单篇路径用 JOIN 同时更新 feed.cache_nbUnreads，小批量下逐条增量更新比整表重算更快 |
+| 6 ~ MAX_VARIABLE_NUMBER | 单条 `UPDATE ... WHERE id IN (...)` + 事后全量 `updateCacheUnreads(null, null)` | 批量越大，逐条 JOIN 的开销越显著，不如一次 UPDATE + 一次 COUNT 重算 |
+| > MAX_VARIABLE_NUMBER | `array_chunk` 递归拆分 | 避免 SQL 参数数量上限 |
+
+关键细节：
+- 批量 SQL 带 `WHERE is_read<>?` 条件（L522），幂等防重复
+- 批量后调用 `updateCacheUnreads(null, null)` 全量重算所有 feed 的未读缓存（L538-L540），用真实 `COUNT(*)` 兜底，杜绝算术累计误差
+- 单篇路径则用 JOIN 原子写，零误差、零额外查询
+
+#### `markFavorite()` 的数组路径 —— 单层策略
+
+[EntryDAO.php L416-L451](file:///d:/fz/0601-1/solo-dogfeeding/code/23-FreshRSS/app/Models/EntryDAO.php#L416-L451) 只有一条路径：
+
+1. 单篇 string 直接包成 `[$ids]`
+2. 超量就 `array_chunk` 递归
+3. 一律 `UPDATE ... WHERE id IN (...)`
+
+与 `markRead()` 的关键差异：
+
+| 对比项 | markRead | markFavorite |
+|--------|----------|--------------|
+| 单篇路径 | ✅ JOIN 原子更新 + feed 缓存增量 | ❌ 无单篇优化，统一走数组路径 |
+| 批量幂等条件 | ✅ `WHERE is_read<>?` 防重复写 | ❌ 无条件，状态未变也会执行 UPDATE（rowCount=0） |
+| 缓存更新 | ✅ JOIN 增量 / COUNT 重算两种策略 | ❌ 无 feed 级收藏缓存，不更新任何缓存 |
+| 扩展钩子 | ❌ 无 | ✅ `Minz_HookType::EntriesFavorite`（批量时传整个 ids 数组） |
+
+### 6.2 控制器层：阅读有范围批量，收藏只有单篇
+
+#### `readAction()`：七类批量入口
+
+[entryController.php L47-L222](file:///d:/fz/0601-1/solo-dogfeeding/code/23-FreshRSS/app/Controllers/entryController.php#L47-L222) 支持的批量维度：
+
+| 类型 | `get` 前缀 | 对应 DAO 方法 | 场景 |
+|------|-----------|--------------|------|
+| 全部 | `a` / `A` / `Z` / `i` | `markReadEntries()` | 全部文章 / 主视图 / 归档 / 重要 |
+| 收藏 | `s` | `markReadEntries(onlyFavorites=true)` | 只标记收藏夹内的 |
+| 分类 | `c_*` | `markReadCat()` | 整个分类一键标读 |
+| Feed | `f_*` | `markReadFeed()` | 单个订阅源一键标读 |
+| 标签 | `t_*` / `T` | `markReadTag()` | 某个标签或所有标签 |
+| 搜索结果 | （search 参数） | `markReadEntries(filters=...)` | 当前布尔搜索结果内全部标读 |
+| 指定 ID 列表 | `id[]` 数组 | `markRead(array)` | 前端批量队列提交 |
+
+所有批量入口都支持 `idMax` fail-safe 和 `state` 状态过滤，与列表查询使用完全相同的过滤条件。
+
+#### `bookmarkAction()`：仅单篇
+
+[entryController.php L232-L246](file:///d:/fz/0601-1/solo-dogfeeding/code/23-FreshRSS/app/Controllers/entryController.php#L232-L246)：
+
+- `paramString` 而非 `paramArrayString`——**不接受数组**
+- `ctype_digit($id)` 强校验——确保是单个数字 ID
+- 没有 `get` 参数分支——不支持分类/Feed/标签范围批量
+- 没有 `search` / `state` 过滤——无法按条件批量
+
+**结论：Web 控制器层不存在"按分类/Feed/标签批量收藏"的入口。** `bookmarkAction` 的设计意图就是"一条一条切换"。
+
+#### 为什么 Web UI 没有批量收藏入口？
+
+产品逻辑上的原因：
+1. **收藏是主动筛选行为**——用户逐条审阅后"加星"，不同于已读标记的"清扫"语义
+2. **收藏没有未读缓存**——`_feed` 表没有 `cache_nbFavorites` 列，批量收藏后不需要重算任何缓存
+3. **收藏夹是虚拟分类**——它没有独立的 feed/category 结构，无法像 `markReadCat` 那样通过 JOIN `_feed` 做范围标记
+
+### 6.3 视图按钮层：阅读有"全部标读"按钮，收藏没有对应按钮
+
+#### 阅读状态的三个批量入口
+
+1. **底部流尾** —— [stream-footer.phtml L52-L64](file:///d:/fz/0601-1/solo-dogfeeding/code/23-FreshRSS/app/views/helpers/stream-footer.phtml#L52-L64) 渲染 `#bigMarkAsRead` 大按钮，用户可配置显示为 big/small/none
+
+2. **侧栏 Feed 下拉菜单** —— [aside_feed.phtml L218-L221](file:///d:/fz/0601-1/solo-dogfeeding/code/23-FreshRSS/app/layout/aside_feed.phtml#L218-L221) 每个 feed 的配置菜单中有"标记此 feed 已读"按钮
+
+3. **顶部导航** —— 标读按钮和下拉菜单（标当前 / 标一天前 / 标一周前 / 标记为未读）
+
+#### 收藏状态没有对应的批量按钮
+
+在所有视图文件中搜索 `bookmark` / `favorite` / `starred`，不存在任何形如"全部收藏/全部取消收藏"的按钮或表单入口。模板中收藏按钮只出现在单条 entry 内部：
+
+- [entry_header.phtml L40-L48](file:///d:/fz/0601-1/solo-dogfeeding/code/23-FreshRSS/app/views/helpers/index/normal/entry_header.phtml#L40-L48)
+- [entry_bottom.phtml L28-L35](file:///d:/fz/0601-1/solo-dogfeeding/code/23-FreshRSS/app/views/helpers/index/normal/entry_bottom.phtml#L28-L35)
+- [article.phtml L33 / L69 / L147](file:///d:/fz/0601-1/solo-dogfeeding/code/23-FreshRSS/app/views/helpers/index/article.phtml#L33)
+
+### 6.4 前端 JS 层：阅读有队列合批，收藏纯单篇逐请求
+
+| 特性 | `mark_read` | `mark_favorite` |
+|------|------------|-----------------|
+| 请求方式 | `fetch()` + async/await | `XMLHttpRequest` 即发即走 |
+| 批量队列 | `mark_read_queue[]` + debounce 定时器（1秒） | 无队列 |
+| 多篇合并 | `send_mark_read_queue([id1, id2, ...])` | 不支持 |
+| 自动触发 | 4 种自动标读（打开/滚动/焦点/点击原网站） | 无自动触发 |
+| 向前批量标读 | `mark_previous_read()` Alt+快捷键 | 无对应功能 |
+| 响应驱动 UI | 服务器返回 `tags` 映射，前端批量更新 | 服务器返回 `url + icon`，前端逐条更新 |
+
+[main.js L324-L351](file:///d:/fz/0601-1/solo-dogfeeding/code/23-FreshRSS/p/scripts/main.js#L324-L351) 中 `mark_read(div, only_not_read, asBatch)` 的第三个参数 `asBatch` 控制是否入队。当自动标读触发时 `asBatch=true`，1 秒窗口内多个条目合并为一次 `id[]` 请求发送。
+
+[main.js L360-L440](file:///d:/fz/0601-1/solo-dogfeeding/code/23-FreshRSS/p/scripts/main.js#L360-L440) 中 `mark_favorite(div)` 没有队列概念，每次点击立即发送 XHR。不存在"多篇文章逐个收藏合并为一次请求"的路径。
+
+### 6.5 API 层：批量收藏能力已完整暴露
+
+虽然 Web UI 没有批量收藏入口，但底层能力是完整的，且在 Google Reader 兼容 API 和 Fever API 中被使用：
+
+#### GReader API —— `edit-tag` 端点
+
+[greader.php L908-L955](file:///d:/fz/0601-1/solo-dogfeeding/code/23-FreshRSS/p/api/greader.php#L908-L955) 的 `editTag()` 方法：
+
+```php
+// 添加 starred 标签（即收藏）
+case 'user/-/state/com.google/starred':
+    $entryDAO->markFavorite($e_ids, true);
+    break;
+
+// 移除 starred 标签（即取消收藏）
+case 'user/-/state/com.google/starred':
+    $entryDAO->markFavorite($e_ids, false);
+    break;
+```
+
+其中 `$e_ids` 是从请求参数 `i=` 解析出的**条目 ID 数组**，可一次性传入多篇。这就是为什么 DAO 层 `markFavorite()` 必须支持数组——**为了兼容 Google Reader API 的批量编辑语义**，而非为 Web UI 准备。
+
+#### Fever API —— `mark=item` 端点
+
+[fever.php](file:///d:/fz/0601-1/solo-dogfeeding/code/23-FreshRSS/p/api/fever.php) 的 mark 请求也支持 `with_ids` 参数传入逗号分隔的多个 ID，最终传给 `markFavorite(array|string $id, bool)`。
+
+---
+
+## 七、列表回显一致性机制深度剖析
+
+尽管阅读和收藏在批量能力上存在巨大不对称，列表回显始终保持一致。以下从五个层面解释其原理。
+
+### 7.1 第一层：服务端渲染是唯一真相源
+
+[normal.phtml L79-L82](file:///d:/fz/0601-1/solo-dogfeeding/code/23-FreshRSS/app/views/index/normal.phtml#L79-L82) / [reader.phtml L37-L40](file:///d:/fz/0601-1/solo-dogfeeding/code/23-FreshRSS/app/views/index/reader.phtml#L37-L40) 中每个 flux `<div>` 的 class 完全由数据库当前值决定：
+
+```php
+<div class="flux<?= !$this->entry->isRead() ? ' not_read' : ''
+    ?><?= $this->entry->isFavorite() ? ' favorite' : ''
+    ?>..." id="flux_<?= $this->entry->id() ?>">
+```
+
+无论上一次操作是单篇还是批量、是 AJAX 还是整页刷新，每次页面加载都从数据库重新读取，CSS class 与数据库状态严格对齐。这是**最终一致性**的根本保障。
+
+### 7.2 第二层：AJAX 操作后全量更新同一 flux 内所有按钮
+
+`mark_read` 和 `mark_favorite` 成功后，都使用 `querySelectorAll` 对当前文章的 DOM 做全面同步更新：
+
+- **阅读状态**：`div.classList.remove/addClass('not_read')` + `div.querySelectorAll('a.read')` 批量更新 href 和图标
+- **收藏状态**：`div.classList.toggle('favorite')` + `div.querySelectorAll('a.bookmark')` 批量更新 href 和图标
+
+`querySelectorAll` 确保同一 flux 内的 header / bottom / article 多处按钮同时被更新，不会出现"顶部改了底部没改"的情况。
+
+> 💡 收藏的 URL 和图标都**不是前端根据当前状态推算**的，而是**由服务端响应 JSON 直接给出**（`json.url` + `json.icon`）。这样做的好处：
+> - 前端不需要知道 URL 构造规则（`is_favorite=0` 的约定）
+> - 服务端是唯一的状态仲裁者，避免前后端逻辑不一致
+> - 如果以后 URL 规则变了（比如加 csrf 参数），前端无需改动
+
+### 7.3 第三层：批量标读走整页刷新，绕过 DOM 一致性问题
+
+stream-footer 和 nav_menu 的"全部标已读"按钮提交表单后，`readAction()` 对非 AJAX 请求返回 302 跳转，浏览器重新加载整个列表页。此时所有 flux 的 class / href / icon 全部由服务端重新渲染，不存在局部更新的问题。
+
+这是一种"**重而可靠**"的策略——范围批量操作影响条目多、涉及缓存复杂，宁可靠整页刷新保证正确，也不用前端局部更新冒险出错。
+
+### 7.4 第四层：侧栏计数器的双路径收敛
+
+侧栏未读数和收藏数有两条更新路径，最终指向同一结果：
+
+| 计数器 | 页面加载时（真相源） | AJAX 操作后（增量更新） |
+|--------|---------------------|----------------------|
+| Feed 未读数 | `feed.nbNotRead()` ← `_feed.cache_nbUnreads` | `incUnreadsFeed()` ±1 |
+| 分类未读数 | `cat.nbNotRead()` ← 聚合 feed 缓存 | `incUnreadsFeed()` 找到 category 祖先 ±1 |
+| 全部未读数 | `FreshRSS_Context::$total_unread` | `incUnreadsFeed()` 中 `.all .title` ±1 |
+| 重要未读数 | `FreshRSS_Context::$total_important_unread` | `incUnreadsFeed()` 中 `.important .title` ±1（feed_priority>=20） |
+| 收藏总数 | `FreshRSS_Context::$total_starred['all']` | `incLabel()` ±1 修改 `.favorites .title` 文本 |
+| 收藏未读数 | `FreshRSS_Context::$total_starred['unread']` | `elem.setAttribute('data-unread', feed_unreads + inc)` |
+| 标签未读数 | `tag.nbUnread()` 实时 COUNT | `incUnreadsTag()` ±1 |
+
+增量更新（JS 侧）与全量计算（PHP 侧）在下次页面刷新时自然收敛。由于收藏只走单篇 AJAX，`±1` 增量不会出现批量场景下的算术误差；而批量标读后走整页刷新，计数器由服务端重新计算，也不存在不一致风险。
+
+### 7.5 第五层：非乐观更新 + 失败回滚
+
+两种状态切换都采用**非乐观更新**策略：
+
+1. 点击后先替换为 spinner 图标给用户即时反馈
+2. 发起 AJAX 请求
+3. **服务器返回 200 且响应有效后**才真正切换 class / URL / 图标 / 计数器
+4. 网络错误或服务器错误时，把 spinner 换回原图标，状态保持不变
+5. `pending_entries[div.id]` 锁防止重复提交
+
+这种"宁可让用户多等几百毫秒，也不出现先显示成功、失败后又闪回去"的策略，保证了 UI 状态与服务器状态严格一致。
+
+### 7.6 为什么收藏没有批量入口也能保持一致？
+
+因为**收藏的一致性问题天然更简单**：
+
+- 只有单篇操作 → 没有"批量后部分成功部分失败"的复杂场景
+- 没有自动触发 → 不会有"滚动时后台悄悄改了状态"与用户操作的冲突
+- 没有 auto_remove → 条目始终留在 DOM 中，不存在"条目已移除但按钮未更新"的问题
+- 单篇操作 + 非乐观更新 → 每一次操作都是原子的，成功或失败泾渭分明
+
+---
+
+## 八、不对称性总结表
+
+| 维度 | 阅读状态（read） | 收藏状态（favorite） |
+|------|-----------------|---------------------|
+| DAO 批量能力 | ✅ string + array | ✅ string + array |
+| DAO 缓存联动 | ✅ `cache_nbUnreads` 原子更新/重算 | ❌ 无 feed 级收藏缓存 |
+| 控制器批量路由 | ✅ `get` 参数按范围路由（分类/Feed/标签/优先级/搜索） | ❌ 仅 `id` 单篇 |
+| 控制器过滤透传 | ✅ `state/search/idMax` | ❌ 无 |
+| 底部流尾批量按钮 | ✅ `bigMarkAsRead` | ❌ 无 |
+| 侧栏 per-feed 标读 | ✅ "标此 feed 已读" | ❌ 无 |
+| 前端队列合并 | ✅ debounce 队列（1秒） | ❌ 即发即走 |
+| 自动触发 | ✅ 4 种自动标读（打开/滚动/焦点/点击原网站） | ❌ 无 |
+| 向前批量快捷键 | ✅ Alt+mark_read → `mark_previous_read()` | ❌ 无 |
+| API 批量入口 | ✅ GReader `edit-tag` + Fever `mark` | ✅ GReader `edit-tag` + Fever `mark` |
+| 过滤规则自动设置 | ✅ `read` 动作 | ✅ `star` 动作（入库时） |
+| AJAX 请求方式 | `fetch()` + async/await | `XMLHttpRequest` |
+| AJAX 后 DOM 更新 | `querySelectorAll('a.read')` 全量替换 | `querySelectorAll('a.bookmark')` 全量替换 |
+| 侧栏计数器更新 | `incUnreadsFeed()` + `incUnreadsTag()` | `incLabel()` + data-unread 属性 |
+| 整页刷新兜底 | ✅ 302 跳转 | ✅ 302 跳转 |
+| 失败回滚 | ✅ spinner 换回原图 + 状态不变 | ✅ spinner 换回原图 + 状态不变 |
+| DOM 移除机制 | ✅ `auto_remove_article` 可选 | ❌ 无 |
+
+---
+
+## 九、完整调用链汇总
+
+### 9.1 单篇切换已读
 ```
 用户点击 <a.read>
   → main.js: init_stream() onclick 委托
@@ -345,9 +584,10 @@ Body: { ajax: true, _csrf, id: [ids...] }
     → delete pending_entries[...]
 ```
 
-### 7.2 单篇切换收藏
+### 9.2 单篇切换收藏
 ```
 用户点击 <a.bookmark>
+  → main.js: init_stream() onclick 委托
   → main.js: mark_favorite(div)
     → pending_entries[flux_XXX]=true, 图标变 spinner
     → XHR POST a.bookmark.href  {ajax, _csrf}
@@ -359,13 +599,14 @@ Body: { ajax: true, _csrf, id: [ids...] }
     ← 成功响应
     → div 切换 favorite class, 所有 a.bookmark href, 所有 a.bookmark 图标
     → 侧栏收藏夹计数 ±1
+    → 若未读，同步更新 favorites 伪分类 data-unread
     → delete pending_entries[...]
 ```
 
-### 7.3 批量（分类/Feed/全部）标为已读
+### 9.3 批量（分类/Feed/全部）标为已读
 ```
-用户点击 #bigMarkAsRead 按钮
-  → <form id="stream-footer"> 提交
+用户点击 #bigMarkAsRead 按钮 或 侧栏 feed 标读按钮
+  → <form id="stream-footer"> / <form id="mark-read-aside"> 提交
     formaction URL 携带 get/nextGet/idMax/search/state/sort/order/from
   → entryController: readAction()
     → 无 id 参数 → switch($type_get)
@@ -373,4 +614,16 @@ Body: { ajax: true, _csrf, id: [ids...] }
         → EntryDAO: 批量 UPDATE _entry.is_read
         → updateCacheUnreads(catId/feedId/null) 重算 feed 缓存
   → 非 AJAX: Minz_Request::good() 302 跳回 index → 整页刷新后所有状态重绘
+```
+
+### 9.4 GReader API 批量收藏（第三方客户端）
+```
+移动 App 调用 edit-tag
+  → POST /api/greader.php/reader/api/0/edit-tag
+    Body: i=id1&i=id2&i=id3&a=user/-/state/com.google/starred
+  → greader.php: editTag()
+    → $entryDAO->markFavorite([id1, id2, id3], true)
+      → EntryDAO: markFavorite(array)  [UPDATE ... WHERE id IN (?,?,?)]
+      → HookType::EntriesFavorite 扩展钩子（传整个 ids 数组）
+  → 返回 OK
 ```
