@@ -260,7 +260,303 @@ final public function getConfigureView(): string|false {
 
 关键：`configure.phtml` 在扩展类的作用域内 `include`，因此 `$this` 指向扩展对象本身，模板可直接访问扩展的属性和方法。
 
-### 3.3 配置表单实践
+### 3.3 配置处理与表单渲染拆分为两步的深度分析
+
+配置页面的执行严格分为两个阶段，体现在 [extensionController::configureAction()](file:///d:/fz/0601-1/solo-dogfeeding/code/28-FreshRSS/app/Controllers/extensionController.php#L123-L151) 中：
+
+```php
+// 阶段一：处理配置（可能修改状态）
+try {
+    $this->view->extension->handleConfigureAction();   // 第 146 行
+} catch (Minz_Exception $e) {
+    // 异常处理
+}
+// 阶段二：渲染表单（只读展示，模板 include）
+// → 在视图 helpers/extension/configure.phtml 第 32 行调用 $ext->getConfigureView()
+```
+
+并且在 [helpers/extension/configure.phtml](file:///d:/fz/0601-1/solo-dogfeeding/code/28-FreshRSS/app/views/helpers/extension/configure.phtml#L30-L38) 中，`handleConfigureAction()` 已经执行完毕之后，才调用 `getConfigureView()` 渲染表单。
+
+#### 原因一：POST-PROCESS-GET-RENDER 的标准 Web 流程
+
+这是典型的"先处理输入，再展示输出"模式。当用户提交表单（POST 请求）时：
+
+1. `handleConfigureAction()` 内部检测 `Minz_Request::isPost()`，读取参数、执行保存
+2. 保存成功后，扩展自身属性（如 `$this->css_rules`）已经更新为最新值
+3. 此时 `getConfigureView()` 渲染的表单自然展示**刚刚提交的最新值**，而不是旧数据
+
+以 [UserCSSExtension::handleConfigureAction()](file:///d:/fz/0601-1/solo-dogfeeding/code/28-FreshRSS/lib/core-extensions/UserCSS/extension.php#L19-L34) 为例：
+
+```php
+public function handleConfigureAction(): void {
+    parent::init();
+    $this->registerTranslates();
+
+    if (Minz_Request::isPost()) {
+        // 阶段一：写入新值
+        $css_rules = Minz_Request::paramString('css-rules', plaintext: true);
+        $this->saveFile(self::FILENAME, $css_rules);
+    }
+
+    // 阶段一还做了一件事：把"当前值"装载到对象属性上
+    $this->css_rules = '';
+    if ($this->hasFile(self::FILENAME)) {
+        $this->css_rules = htmlspecialchars($this->getFile(self::FILENAME) ?? '', ENT_NOQUOTES, 'UTF-8');
+    }
+    // 之后，getConfigureView() 中的 <?= $this->css_rules ?> 就能读取到刚写入的值
+}
+```
+
+如果把处理和渲染混在一起，开发者很容易在渲染过程中执行写入，导致重复写入、或者渲染到一半发现出错无法优雅回滚。
+
+#### 原因二：异常处理边界清晰
+
+`handleConfigureAction()` 被 try-catch 完整包裹（[第 145-150 行](file:///d:/fz/0601-1/solo-dogfeeding/code/28-FreshRSS/app/Controllers/extensionController.php#L145-L150)）。如果它抛异常，控制器会：
+1. 记录错误日志
+2. 通过 `Minz_Request::bad()` 执行**重定向**到扩展列表页，并带错误提示
+
+这保证了异常发生时**不会进入渲染阶段**，避免渲染到一半出错导致的半截 HTML 页面。
+
+反过来，`getConfigureView()`（[Extension.php#L114-L123](file:///d:/fz/0601-1/solo-dogfeeding/code/28-FreshRSS/lib/Minz/Extension.php#L114-L123)）没有 try-catch 包裹——它只执行 `include $filename`，是纯模板渲染。模板开发者只需要关心展示，不需要处理异常流。
+
+#### 原因三：职责分离与可测试性
+
+两个方法职责分明：
+
+| 方法 | 职责 | 副作用 | 可被谁调用 |
+|---|---|---|---|
+| `handleConfigureAction()` | 读取请求参数、验证、写入配置、准备视图数据 | 可能写入文件、修改配置、注册翻译 | 控制器（在 HTTP 请求上下文中） |
+| `getConfigureView()` | 读取扩展对象上已准备好的属性，输出 HTML | 无（仅 include 模板，输出缓冲） | 任何需要渲染配置 UI 的地方 |
+
+这种分离使得：
+- `handleConfigureAction()` 可以在不渲染的情况下单独进行单元测试（构造 mock 请求，断言扩展属性和存储结果）
+- `getConfigureView()` 可以在不发起真实请求的情况下被调用（只需先设置好扩展属性，断言返回的 HTML）
+
+#### 原因四：AJAX/Slider 模式复用同一套逻辑
+
+[configureAction()](file:///d:/fz/0601-1/solo-dogfeeding/code/28-FreshRSS/app/Controllers/extensionController.php#L124-L129) 支持三种显示模式：
+
+```php
+if (Minz_Request::paramBoolean('ajax')) {
+    $this->view->_layout(null);              // AJAX：无布局
+} elseif (Minz_Request::paramBoolean('slider')) {
+    $this->indexAction();
+    $this->view->_path('extension/index.phtml'); // Slider：在列表页内嵌
+}
+// 默认：独立页面
+```
+
+三种模式共享同一个 `handleConfigureAction()` 处理逻辑，但渲染方式不同。把处理和渲染分开，使得控制器可以根据请求参数切换渲染目标（不同的 view path 和 layout），而处理逻辑无需改动。
+
+#### 原因五：框架级生命周期的强制保证
+
+"先处理再渲染"并非 `configureAction()` 凭自觉遵守的约定，而是由 [Minz_Dispatcher::run()](file:///d:/fz/0601-1/solo-dogfeeding/code/28-FreshRSS/lib/Minz/Dispatcher.php#L39-L63) 的代码结构从底层**强制保证**的两个独立阶段：
+
+```php
+do {
+    self::$needsReset = false;
+    try {
+        $this->createController(...);
+        $this->controller->init();
+        $this->controller->firstAction();
+        if (!self::$needsReset) {
+            // ───────────────── 阶段一：Action 执行 ─────────────────
+            $this->launchAction(                  // 第 48-51 行
+                Minz_Request::actionName() . 'Action'
+            );
+            // 在此期间，configureAction() 完整运行，包括：
+            //   1. 调用 handleConfigureAction() → 写入配置、准备视图数据
+            //   2. 给 $this->view->extension 赋值
+            //   3. 选择 view path / layout（ajax、slider、default）
+            //   Action return 后，控制权才回到 Dispatcher
+        }
+        $this->controller->lastAction();
+
+        if (!self::$needsReset) {
+            $this->controller->declareCspHeader();
+            // ───────────────── 阶段二：视图构建 ─────────────────
+            $this->controller->view()->build();   // 第 57 行
+            // 此时才 include phtml 模板，模板中调用 getConfigureView()
+            // 模板内的 $this->css_rules 等属性读取到的是
+            // 阶段一 handleConfigureAction() 已准备好的最新值
+        }
+    } catch (Minz_Exception $e) {
+        throw $e;
+    }
+} while (self::$needsReset);
+```
+
+**这就是"为何先处理配置再渲染表单"的最底层答案：** 整个 Minz 框架的请求生命周期被 Dispatcher 切成 **Action 执行 → View 构建** 两个串行阶段。前者的副作用（配置写入、视图变量赋值）必然在后者读取之前完成。把 `handleConfigureAction()` 放在 Action 里、`getConfigureView()` 放在模板里，只是对这个框架级顺序的自然遵循，而不是人为约定。
+
+这带来了两个扩展开发者不需要自己处理的好处：
+
+1. **时序安全**：无论扩展开发者如何实现 `handleConfigureAction()`，其内部对 `saveFile()` 或 `setUserConfigurationValue()` 的调用都发生在视图渲染之前，因此模板中读取到的属性必然是提交后的新值，不会出现"显示旧值"或"部分更新"的竞态。
+2. **渲染可控**：如果 Action 阶段调用了 `Minz_Request::forward()` 或 `bad()` 触发 exit（见下一节分析），Dispatcher 的 `view()->build()` 完全不会执行，避免半截 HTML。
+
+#### 代码链路走查示例
+
+以 UserCSS 扩展提交 CSS 规则为例，完整时序：
+
+```
+[HTTP POST] ?c=extension&a=configure&e=User+CSS
+       │
+       ▼
+Minz_Dispatcher::run() 阶段一
+  launchAction('configureAction')
+    │
+    ├─ configureAction() [L123-L151]
+    │    ├─ 解码 'e' → 'User CSS'
+    │    ├─ findExtension('User CSS')
+    │    ├─ try {
+    │    │     $this->view->extension->handleConfigureAction()  ← 执行扩展处理
+    │    │       │
+    │    │       ├─ UserCSSExtension::handleConfigureAction()
+    │    │       │    ├─ parent::init()
+    │    │       │    ├─ $this->registerTranslates()
+    │    │       │    ├─ isPost() == true
+    │    │       │    │    ├─ paramString('css-rules')  ← 从 $_POST 读取输入
+    │    │       │    │    └─ saveFile('custom.css', $css_rules)  ← 写入磁盘
+    │    │       │    ├─ hasFile('custom.css') == true
+    │    │       │    └─ $this->css_rules = htmlspecialchars(...)  ← 属性设置为最新值
+    │    │       └─ 返回 void
+    │    └─ } catch (Minz_Exception $e) { ... }
+    │    ├─ 根据 ajax/slider 参数选择 view path 和 layout
+    │    └─ 方法正常 return
+    │
+  Dispatcher 阶段二  ←  Action 已经 return，此时才开始渲染
+    view()->build()
+      include extension/configure.phtml
+        include helpers/extension/configure.phtml [L32]
+          $ext->getConfigureView()
+            include UserCSS/configure.phtml
+              <?= $this->css_rules ?>    ← 读取到阶段一刚刚设置的最新值
+```
+
+### 3.4 配置失败的影响隔离机制
+
+配置失败主要指 `handleConfigureAction()` 在处理 POST 时抛出 `Minz_Exception`。其隔离措施与启用失败在机制和意图上都有本质区别：
+
+#### 隔离层一：exit() 硬阻断，阻止任何视图输出
+
+在 [configureAction() 的 catch 块](file:///d:/fz/0601-1/solo-dogfeeding/code/28-FreshRSS/app/Controllers/extensionController.php#L145-L150)：
+
+```php
+try {
+    $this->view->extension->handleConfigureAction();
+} catch (Minz_Exception $e) {
+    Minz_Log::error(...);
+    Minz_Request::bad(
+        _t('feedback.extensions.enable.ko', $ext_name, _url('index', 'logs')),
+        ['c' => 'extension', 'a' => 'index']
+    );   // ← 这一行内部会 exit()
+}
+```
+
+调用链如下：
+`bad()` [Request.php#L528-L531](file:///d:/fz/0601-1/solo-dogfeeding/code/28-FreshRSS/lib/Minz/Request.php#L528-L531)
+→ `setBadNotification($msg)` + `forward($url, true)`
+→ `forward(redirect=true)` [Request.php#L499-L501](file:///d:/fz/0601-1/solo-dogfeeding/code/28-FreshRSS/lib/Minz/Request.php#L499-L501)：
+
+```php
+if ($redirect) {
+    header('Location: ' . Minz_Url::display($url, 'php', 'root'));
+    exit();   // ← PHP 进程在此终止
+}
+```
+
+`exit()` 的关键效果：
+- **Dispatcher 的 `view()->build()` 永远不会被执行**——因为 Action 阶段没有正常 return，流程被硬切断。这意味着即使在抛出异常之前 `handleConfigureAction()` 已经部分修改了视图变量，这些值也绝不会被渲染到任何 HTML 中。
+- 浏览器收到的是标准的 `302` 重定向响应，而不是半截页面或 PHP 致命错误信息。
+- 错误消息通过 session flash（`setBadNotification()`）暂存，在重定向后的下一个页面（扩展列表页）取出展示，避免 PRG 问题（Post/Redirect/Get）。
+
+#### 隔离层二：配置对象的多层命名空间，写入不越界
+
+扩展配置写入走 [setConfiguration()](file:///d:/fz/0601-1/solo-dogfeeding/code/28-FreshRSS/lib/Minz/Extension.php#L423-L444)，经历三层命名空间隔离：
+
+```php
+private function setConfiguration(string $type, array $configuration): void {
+    // ── 第一层命名空间隔离：系统配置对象 vs 用户配置对象 ──
+    switch ($type) {
+        case 'system':
+            $conf = FreshRSS_Context::systemConf();   // ← 独立静态变量 $system_conf
+            break;                                     //    对应文件 data/config.php
+        case 'user':
+            $conf = FreshRSS_Context::userConf();     // ← 独立静态变量 $user_conf
+            break;                                     //    对应文件 data/users/{名字}/config.php
+        default: return;
+    }
+
+    // ── 第二层命名空间隔离：extensions 子数组 ──
+    if ($conf->hasParam('extensions')) {
+        $extensions = $conf->extensions;              // ← 读取 conf->extensions 整体
+    } else {
+        $extensions = [];
+    }
+    $extensions[$this->getName()] = $configuration;  // ← 只改 extensions[扩展名] 这一格
+                                                      //    绝不触碰其他扩展名
+    $conf->extensions = $extensions;
+
+    // ── 第三层隔离：原子写入 ──
+    $conf->save();   // ← Configuration::save() 的 tmp + bak + rename 三步
+}
+```
+
+**第一层：配置对象分离。** [FreshRSS_Context](file:///d:/fz/0601-1/solo-dogfeeding/code/28-FreshRSS/app/Models/Context.php#L66-L180) 维护两个完全独立的静态变量：
+- `FreshRSS_Context::$system_conf`（`FreshRSS_SystemConfiguration` 实例，由 `initSystem()` 加载 `DATA_PATH/config.php`）
+- `FreshRSS_Context::$user_conf`（`FreshRSS_UserConfiguration` 实例，由 `initUser()` 加载 `USERS_PATH/{username}/config.php`）
+
+用户扩展只能走到 `case 'user'` 分支，拿到的是当前登录用户专属的配置对象——文件名里带用户名，根本不可能写入到其他用户或系统配置的文件里。
+
+**第二层：extensions 子数组。** 即使用户扩展能操作 `$conf`，所有写入也被限制在 `$conf->extensions[扩展名]`。扩展配置和诸如 `language`、`theme`、`posts_per_page` 等核心配置字段**不处于同一层级**——即使 `$configuration` 本身包含脏数据，也无法通过数组覆盖核心字段。
+
+**第三层：原子写入。** [Configuration::save()](file:///d:/fz/0601-1/solo-dogfeeding/code/28-FreshRSS/lib/Minz/Configuration.php#L221-L244) 采用三步写文件协议：
+
+```
+① file_put_contents(config.php.tmp.php, ..., LOCK_EX)   写临时文件（排他锁）
+      ↓ 失败？→ unlink(tmp)，返回 false（原文件毫发无损）
+② copy(config.php, config.php.bak.php)                  做备份
+      ↓ 失败？→ unlink(tmp)，返回 false
+③ rename(config.php.tmp.php, config.php)                原子替换
+④ opcache_invalidate(config.php)                        清理 opcode 缓存
+```
+
+如果 `handleConfigureAction()` 在 `save()` 之后抛异常（例如扩展在 save 之后还做了别的验证），最坏情况是"配置已经写入但异常被抛出"。不过由于步骤①-③保证写入原子性，磁盘上的配置文件要么是完整的新版本，要么是完整的旧版本，绝不会出现半写入的损坏 PHP 数组（那会导致下次 include 时整站崩溃）。
+
+#### 隔离层三：文件存储沙箱 + 路径净化
+
+当扩展使用文件 API（`saveFile()`）时，不仅 [hasFile()](file:///d:/fz/0601-1/solo-dogfeeding/code/28-FreshRSS/lib/Minz/Extension.php#L183-L188) 拒绝空文件名和 `..`，沙箱路径本身也是多层隔离：
+
+```php
+final public function getExtensionUserPath(): string {
+    $username = Minz_User::name() ?: '_';
+    // 路径 = data/users/{当前用户名}/extensions/{扩展entrypoint}/
+    return USERS_PATH . "/{$username}/extensions/{$this->getEntrypoint()}";
+}
+```
+
+三层路径组件都是动态绑定：
+1. `USERS_PATH` 指向用户数据根目录
+2. `{$username}` 是当前登录用户的名字（登录前为 `_`，但那时配置操作不会运行）
+3. `{$this->getEntrypoint()}` 是扩展的 entrypoint 字段，来自 metadata.json 且已在加载时做了 `ctype_alnum + '_'` 的字符集校验
+
+所以即使 `$filename` 被绕过了 hasFile 检查（通过某种漏洞方式传给 `saveFile()`），文件操作的目录前缀也把它牢牢限制在特定用户、特定扩展的文件夹中——无法越权修改其他扩展文件，更无法触及其他用户数据。
+
+#### 隔离层四：异常类型过滤不吞 PHP 原生 Error
+
+与启用失败的 catch 相同，配置失败的 catch 也只捕获 `Minz_Exception`。所以如果扩展的配置处理代码触发了真正的 PHP Error（`TypeError`、`ValueError`、未定义函数等），异常**不会**被 catch，而是由全局错误处理器接管（通常记 fatal 日志并显示通用错误页）。这防止了扩展代码的结构性缺陷被静默掩盖——配置逻辑有 bug 就应该让它在日志里明显暴露，而不是伪装成"保存失败请重试"。
+
+#### 配置失败 vs 启用失败的隔离策略对比
+
+| 维度 | 启用失败（init()） | 配置失败（handleConfigureAction()） |
+|---|---|---|
+| 捕获异常类型 | `Minz_Exception` | `Minz_Exception` |
+| 故障恢复方式 | 自动禁用该扩展，下一次请求再次尝试 | 重定向到列表页，用户手动重试 |
+| 持久化状态 | 不回滚配置（保留启用标记） | 不保存配置（回滚到之前状态） |
+| 内存状态 | 从 `$ext_list_enabled` 移除 | 不改变启用状态 |
+| 用户反馈 | 仅日志 | 日志 + 页面错误提示 + 日志页面链接 |
+| 故障影响范围 | 该扩展对所有操作不可用 | 仅本次配置保存失败，扩展其他功能正常 |
+
+### 3.5 配置表单实践
 
 以 [UserCSSExtension](file:///d:/fz/0601-1/solo-dogfeeding/code/28-FreshRSS/lib/core-extensions/UserCSS/extension.php) 为例：
 
@@ -294,7 +590,7 @@ public function handleConfigureAction(): void {
 </form>
 ```
 
-### 3.4 扩展配置数据的读写
+### 3.6 扩展配置数据的读写
 
 扩展配置有两种存储机制：
 
@@ -333,7 +629,7 @@ public function handleConfigureAction(): void {
 | `removeFile($filename)` | 删除文件 |
 | `getFileUrl($filename)` | 获取文件 URL |
 
-### 3.5 静态资源服务
+### 3.7 静态资源服务
 
 扩展的静态文件通过 [p/ext.php](file:///d:/fz/0601-1/solo-dogfeeding/code/28-FreshRSS/p/ext.php) 提供，安全限制：
 
@@ -344,7 +640,7 @@ public function handleConfigureAction(): void {
 
 用户私有文件通过 [serveAction()](file:///d:/fz/0601-1/solo-dogfeeding/code/28-FreshRSS/app/Controllers/extensionController.php#L336-L359) 提供，需要扩展已启用且文件存在。
 
-### 3.6 配置页的两种显示模式
+### 3.8 配置页的两种显示模式
 
 在 [configureAction()](file:///d:/fz/0601-1/solo-dogfeeding/code/28-FreshRSS/app/Controllers/extensionController.php#L124-L129) 中：
 
