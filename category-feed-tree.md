@@ -1256,4 +1256,5 @@ ORDER BY c.name, f.name
 | 主题 CSS | [frss.css](file:///d:/fz/0601-1/solo-dogfeeding/code/22-FreshRSS/p/themes/base-theme/frss.css) | `data-unread-hide` 样式处理 |
 | 翻译系统 | [Translate.php](file:///d:/fz/0601-1/solo-dogfeeding/code/22-FreshRSS/lib/Minz/Translate.php) | `t()`, `resolveKey()`, `loadKey()` |
 | 中文翻译 | [zh-CN/gen.php](file:///d:/fz/0601-1/solo-dogfeeding/code/22-FreshRSS/app/i18n/zh-CN/gen.php) | `'default_category' => '未分类'` |
-| 英语翻译 | [en/
+| 英语翻译 | [en/gen.php](file:///d:/fz/0601-1/solo-dogfeeding/code/22-FreshRSS/app/i18n/en/gen.php) | `'default_category' => 'Uncategorized'` |
+| 用户默认配置 | [config-user.default.php](file:///d:/fz/0601-1/solo-dogfeeding/code/22-FreshRSS/config-user.default.php) | `show_unread_count`, `display_categories`, `hide_read_feeds` |
