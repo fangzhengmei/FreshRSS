@@ -188,10 +188,14 @@ JS 事件捕获：点击 .item.labels a.dropdown-toggle
     ↓
 调用 show_labels_menu(el)  [main.js L780]
     ↓
-检查：下拉菜单是否已存在？且 forceReloadLabelsList=false？
-    ├── 否（首次打开或强制重载）→ 加载模板 + 调用 loadDynamicTags()
-    └── 是 → 直接显示已缓存的菜单（无需重复请求）
+检查条件：if (!dropdownMenu || forceReloadLabelsList)
+    ├─ 满足任一条件（菜单不存在 或 标志为 true）→ 删除旧DOM → loadDynamicTags() 发AJAX
+    └─ 两条件都不满足（菜单存在 且 forceReloadLabelsList=false）→ 直接显示已有DOM
 ```
+
+> ⚠️ **关键事实（必须对齐）**：
+> - 阶段一 `forceReloadLabelsList=false`（当前页面从未新建过标签）：同一篇文章第二次及以后打开菜单可复用已有 DOM，零 AJAX 请求
+> - 一旦用户在当前页面新建任何标签 → `forceReloadLabelsList=true`（代码中无任何地方会将其重置回 `false`）→ **当前页面后续每一次打开任何文章的标签菜单，都会删除旧 DOM 并重新发 AJAX 请求**，在页面刷新之前永远不会再走 DOM 缓存复用的分支
 
 > 代码参考：[p/scripts/main.js](p/scripts/main.js#L780-L797)
 
@@ -477,32 +481,34 @@ let forceReloadLabelsList = false;
 ```
 页面加载: forceReloadLabelsList = false
   ↓
-阶段一：从未新建过标签
+阶段一：从未新建过标签（flag = false）
   ├─ 打开文章A菜单 → dropdownMenu不存在 → 条件A满足 → AJAX请求 → DOM写入
-  ├─ 关闭后再打开A菜单 → dropdownMenu存在 + flag=false → 条件均不满足 → 复用DOM ★零请求
+  ├─ 关闭后再打开A菜单 → dropdownMenu存在 + flag=false → 两条件都不满足 → 复用DOM ★零请求
   ├─ 打开文章B菜单 → dropdownMenu不存在 → 条件A满足 → AJAX请求 → DOM写入
-  └─ 关闭后再打开B菜单 → dropdownMenu存在 + flag=false → 复用DOM ★零请求
+  └─ 关闭后再打开B菜单 → dropdownMenu存在 + flag=false → 两条件都不满足 → 复用DOM ★零请求
   ↓
 用户在某篇文章中新建了一个标签
   ↓
-onloadend: forceReloadLabelsList = true  ← 永久置位，不会回退
+onloadend: forceReloadLabelsList = true  ← ★ 永久置位，代码中无任何位置会将其重置为 false
   ↓
-阶段二：forceReloadLabelsList === true（永久）
+阶段二：forceReloadLabelsList === true（**永久，直到页面刷新）
   ├─ 打开文章C菜单 → dropdownMenu不存在 → 条件A满足 → AJAX请求
   ├─ 关闭后再打开C菜单 → dropdownMenu存在 + flag=true → 条件B满足 → 删除旧DOM → AJAX请求
   ├─ 打开文章A菜单 → dropdownMenu存在 + flag=true → 条件B满足 → 删除旧DOM → AJAX请求
-  └─ 每次打开任何文章菜单 → 必然删除旧DOM → 必然AJAX请求 ★无法复用
+  └─ **此后每一次打开任何文章的菜单 → 必然满足条件B → 必然删除旧DOM → 必然发AJAX请求 ★完全无法复用DOM缓存
   ↓
-  （直到页面刷新/导航离开，forceReloadLabelsList 才会随 JS 上下文销毁重置为 false）
+  （只有页面刷新或导航离开，forceReloadLabelsList 才会随 JS 上下文销毁，下一次页面加载重新初始化为 false
 ```
 
 #### 对一致性和请求次数的影响
 
 | 场景 | 请求次数 | 说明 |
 |------|---------|------|
-| **从未新建标签** | 每篇文章首次打开 1 次，后续复用 0 次 | 条件A控制：首次没有 DOM 必须请求，之后有 DOM 且 flag=false 可复用 |
-| **新建标签后** | **每次打开菜单都 1 次** | 条件B控制：flag=true 导致每次都删除旧 DOM 并重新请求 |
-| **页面刷新后** | 回到"从未新建标签"状态 | flag 随页面重新初始化为 false |
+| **从未新建标签** | 每篇文章首次打开 1 次，后续重复打开 0 次 | 条件A控制：首次没有 DOM 必须请求，之后有 DOM 且 flag=false 可复用 |
+| **新建标签后** | **每次打开菜单都 1 次，无例外 | 条件B控制：flag=true 导致每次都删除旧 DOM 并重新请求，永不复用 |
+| **页面刷新后** | 回到"从未新建标签"状态 | flag 随页面重新初始化为 false，重新开始阶段一 |
+
+**核心结论（必须对齐）：一旦用户在当前页面新建过任何标签，此后当前页面中每一次打开任何文章的标签菜单，都会重新向服务器发请求，永远不会再走 DOM 缓存复用的路径。**
 
 **一致性影响**：
 - 阶段一（flag=false）：标签列表依赖 DOM 缓存，如果其他用户/会话创建了新标签，当前页面不会感知。但在单用户场景下，缓存期内的列表是自洽的（只有自己能创建标签，自己刚操作过）。
@@ -873,7 +879,7 @@ AND e.id IN (SELECT et.id_entry FROM _entrytag et, _tag t WHERE et.id_tag = t.id
 6. **过滤规则驱动自动打标**：标签可配置布尔搜索规则，新文章入库时自动匹配并打标
 7. **多数据库适配**：通过工厂模式 + DAO 继承，支持 MySQL/SQLite/PostgreSQL，差异仅在 SQL 方言细节
 8. **多操作入口**：Web UI、Controller 直接调用、GReader API 三种方式管理标签和打标
-9. **前端下拉菜单惰性加载 + 缓存**：首次打开才 AJAX 拉取，复用缓存；仅新建标签时触发全局强制刷新
+9. **前端下拉菜单惰性加载 + 单向不可逆缓存失效**：初始阶段（`forceReloadLabelsList=false`）首次打开 AJAX 拉取后复用 DOM 缓存；一旦用户新建标签，标志永久置为 `true`，后续每次打开菜单都删除旧 DOM 并重新请求，因为 `checked` 状态因文章而异无法客户端缓存
 10. **未读数乐观回写**：AJAX 成功后直接更新 DOM 中 `data-unread` 属性，不等待页面刷新，保证用户体验流畅
 
 ### 10.2 数据流向图
