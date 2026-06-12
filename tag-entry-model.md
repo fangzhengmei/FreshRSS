@@ -790,12 +790,16 @@ AND e.id IN (SELECT et.id_entry FROM _entrytag et, _tag t WHERE et.id_tag = t.id
 ┌─────────────┐              ┌──────────────┐              ┌──────────────┐              ┌──────────────┐
 │   用户浏览器  │              │  main.js 前端 │              │ tagController │              │  TagDAO 后端  │
 └──────┬──────┘              └──────┬───────┘              └──────┬───────┘              └──────┬───────┘
-       │ 点击标签图标               │                            │                            │
+
+ ════════════════════════ 阶段一：forceReloadLabelsList=false ════════════════════════
+
+       │ 首次打开文章A的标签图标     │                            │                            │
        │──────────────────────────>│                            │                            │
-       │                            │ 1. show_labels_menu()       │                            │
-       │                            │    判断是否需要重新加载      │                            │
-       │                            │ 2. loadDynamicTags()        │                            │
-       │                            │    GET getTagsForEntry      │                            │
+       │                            │ 1. show_labels_menu(el)     │                            │
+       │                            │    dropdownMenu 不存在      │                            │
+       │                            │    → 条件A(!dropdownMenu)满足 │                           │
+       │                            │    → 插入模板 + loadDynamicTags │                         │
+       │                            │    → GET getTagsForEntry    │                            │
        │                            │───────────────────────────>│                            │
        │                            │                            │ getTagsForEntryAction()    │
        │                            │                            │───────────────────────────>│
@@ -803,66 +807,114 @@ AND e.id IN (SELECT et.id_entry FROM _entrytag et, _tag t WHERE et.id_tag = t.id
        │                            │                            │                            │ 返回 [{id,name,checked}]
        │                            │                            │<───────────────────────────│
        │                            │<───────────────────────────│                            │
-       │                            │ 3. 渲染 checkbox 列表        │                            │
-       │                            │    构建 DOM                 │                            │
+       │                            │ 2. 渲染 checkbox 列表        │                            │
+       │                            │    写入 dropdownMenu DOM    │                            │
        │ 看到标签列表               │<───────────────────────────│                            │
        │<───────────────────────────│                            │                            │
        │                            │                            │                            │
-       │ 勾选已有标签 #5             │                            │                            │
+       │ 再次打开文章A的标签图标     │                            │                            │
        │──────────────────────────>│                            │                            │
-       │                            │ 4. stream.onchange 触发      │                            │
-       │                            │    解析 tagId=5, entryId=xxx │                            │
-       │                            │    POST tagEntry JSON Body   │                            │
-       │                            │    {_csrf,id_tag:5,         │                            │
-       │                            │     id_entry,checked:true}  │                            │
-       │                            │───────────────────────────>│                            │
-       │                            │                            │ tagEntryAction()           │
-       │                            │                            │───────────────────────────>│
-       │                            │                            │                            │ tagEntry(): INSERT IGNORE
-       │                            │                            │                            │ INTO _entrytag
-       │                            │                            │<───────────────────────────│
-       │                            │ 5. onload 回调              │                            │
-       │                            │    文章未读? → incUnreadsTag │                            │
-       │                            │    #t_5 data-unread +1       │                            │
-       │                            │ 6. onloadend 回调            │                            │
-       │                            │    移除其他重复下拉菜单 DOM   │                            │
-       │ 侧边栏标签 #5 未读数+1     │                            │                            │
+       │                            │ 3. show_labels_menu(el)     │                            │
+       │                            │    dropdownMenu 已存在      │                            │
+       │                            │    forceReloadLabelsList=false │                          │
+       │                            │    → 两个条件都不满足       │                            │
+       │                            │    → return true（直接显示） │                            │
+       │                            │    ★ 零 AJAX 请求，复用 DOM │                            │
+       │ 直接看到上次标签列表        │                            │                            │
        │<───────────────────────────│                            │                            │
-       │                            │                            │                            │
+
+ ════════════════════════ 新建标签：forceReloadLabelsList 永久置位 ══════════════════
+
        │ 勾选"新建标签"输入"紧急"    │                            │                            │
        │──────────────────────────>│                            │                            │
-       │                            │ 7. 解析 tagId=0,            │                            │
-       │                            │    name_tag="紧急"          │                            │
+       │                            │ 4. stream.onchange 触发      │                            │
+       │                            │    tagId=0, name_tag="紧急"  │                            │
        │                            │    POST tagEntry            │                            │
        │                            │    {_csrf,id_tag:0,         │                            │
        │                            │     name_tag:"紧急",...}    │                            │
        │                            │───────────────────────────>│                            │
-       │                            │                            │ 8. searchByName("紧急")    │
+       │                            │                            │ 5. searchByName("紧急")    │
        │                            │                            │    不存在 → addTag()        │
        │                            │                            │───────────────────────────>│
        │                            │                            │                            │ INSERT _tag → 返回新ID=12
        │                            │                            │<───────────────────────────│
-       │                            │                            │ 9. tagEntry(id=12,...)     │
+       │                            │                            │ 6. tagEntry(id=12,...)     │
        │                            │                            │───────────────────────────>│
        │                            │                            │                            │ INSERT _entrytag
        │                            │                            │<───────────────────────────│
-       │                            │ 10. onloadend 回调          │                            │
-       │                            │     forceReloadLabelsList=true │                          │
-       │                            │     loadDynamicTags() → 刷新 │                            │
-       │                            │     → GET getTagsForEntry  │ │                            │
-       │                            │    （现在返回包含 id:12 的列表）│                            │
-       │ 菜单显示新标签"紧急"已勾选  │                            │                            │
+       │                            │ 7. onload 回调              │                            │
+       │                            │    文章未读 → incUnreadsTag │                            │
+       │ 侧边栏标签未读数+1          │                            │                            │
+       │                            │ 8. onloadend 回调           │                            │
+       │                            │    tagId==0 → 进入新建分支  │                            │
+       │                            │    ★ forceReloadLabelsList=true │                         │
+       │                            │    （永久置位，代码中无任何   │                            │
+       │                            │     位置会将其重置为 false） │                            │
+       │                            │    → loadDynamicTags(当前菜单) │                           │
+       │                            │    → GET getTagsForEntry    │                            │
+       │                            │───────────────────────────>│                            │
+       │                            │                            │───────────────────────────>│
+       │                            │                            │                            │ 返回含 id:12 的列表
+       │                            │                            │<───────────────────────────│
+       │                            │<───────────────────────────│                            │
+       │                            │ 9. 重新渲染 checkbox 列表    │                            │
+       │                            │    新标签"紧急"已勾选        │                            │
+       │ 菜单刷新，看到新标签已勾选  │                            │                            │
+       │<───────────────────────────│                            │                            │
+
+ ════════════════════════ 阶段二：forceReloadLabelsList=true（永久，直到页面刷新） ═══
+
+       │ 打开文章B的标签菜单         │                            │                            │
+       │──────────────────────────>│                            │                            │
+       │                            │ 10. show_labels_menu(el)    │                            │
+       │                            │     dropdownMenu 不存在     │                            │
+       │                            │     → 条件A满足（与flag无关）│                            │
+       │                            │     → 插入模板 + loadDynamicTags │                        │
+       │                            │     → GET getTagsForEntry   │                            │
+       │                            │───────────────────────────>│                            │
+       │                            │                            │───────────────────────────>│
+       │                            │                            │                            │ 返回含 id:12 的列表
+       │                            │                            │<───────────────────────────│
+       │                            │<───────────────────────────│                            │
+       │ 看到新标签"紧急"未勾选      │                            │                            │
        │<───────────────────────────│                            │                            │
        │                            │                            │                            │
-       │ 打开另一篇文章的标签菜单    │                            │                            │
+       │ 关闭后再打开文章B的标签菜单 │                            │                            │
        │──────────────────────────>│                            │                            │
-       │                            │ 11. show_labels_menu()      │                            │
-       │                            │     检查 forceReloadLabelsList │                          │
-       │                            │     = true → 删除旧缓存     │                            │
-       │                            │     → 重新 loadDynamicTags  │                            │
-       │                            │     （包含新标签"紧急"）     │                            │
-       │ 看到新标签"紧急"            │                            │                            │
+       │                            │ 11. show_labels_menu(el)    │                            │
+       │                            │     dropdownMenu 已存在     │                            │
+       │                            │     forceReloadLabelsList=true │                          │
+       │                            │     → ★ 条件B满足          │                            │
+       │                            │     → 删除旧 dropdownMenu DOM │                           │
+       │                            │     → 插入新模板 + loadDynamicTags │                      │
+       │                            │     → GET getTagsForEntry   │                            │
+       │                            │───────────────────────────>│                            │
+       │                            │                            │───────────────────────────>│
+       │ 再次 AJAX 请求，拿到最新列表│                            │                            │
        │<───────────────────────────│                            │                            │
+       │                            │                            │                            │
+       │ 再打开文章C的标签菜单       │                            │                            │
+       │──────────────────────────>│                            │                            │
+       │                            │ 12. show_labels_menu(el)    │                            │
+       │                            │     dropdownMenu 不存在     │                            │
+       │                            │     → 条件A满足 → AJAX 请求 │                            │
+       │                            │                            │                            │
+       │ 关闭后再打开文章C的标签菜单 │                            │                            │
+       │──────────────────────────>│                            │                            │
+       │                            │ 13. show_labels_menu(el)    │                            │
+       │                            │     dropdownMenu 已存在     │                            │
+       │                            │     forceReloadLabelsList仍=true │                        │
+       │                            │     → ★ 条件B再次满足      │                            │
+       │                            │     → 再次删除旧DOM        │                            │
+       │                            │     → 再次 AJAX 请求       │                            │
+
+ ════════════════════════ 结论 ════════════════════════════════════════════════════════
+
+       │ 阶段二之后，每次打开任意文章的标签菜单：
+       │   - 首次打开该文章 → 条件A(!dropdownMenu) 满足 → AJAX 请求
+       │   - 再次打开该文章 → 条件B(forceReloadLabelsList) 满足 → 删除旧DOM → AJAX 请求
+       │   ★ 永远不会再走 return true 的 DOM 缓存复用分支
+       │   ★ 只有页面刷新，forceReloadLabelsList 才随 JS 上下文重置为 false
 ```
 
 ---
@@ -879,7 +931,7 @@ AND e.id IN (SELECT et.id_entry FROM _entrytag et, _tag t WHERE et.id_tag = t.id
 6. **过滤规则驱动自动打标**：标签可配置布尔搜索规则，新文章入库时自动匹配并打标
 7. **多数据库适配**：通过工厂模式 + DAO 继承，支持 MySQL/SQLite/PostgreSQL，差异仅在 SQL 方言细节
 8. **多操作入口**：Web UI、Controller 直接调用、GReader API 三种方式管理标签和打标
-9. **前端下拉菜单惰性加载 + 单向不可逆缓存失效**：初始阶段（`forceReloadLabelsList=false`）首次打开 AJAX 拉取后复用 DOM 缓存；一旦用户新建标签，标志永久置为 `true`，后续每次打开菜单都删除旧 DOM 并重新请求，因为 `checked` 状态因文章而异无法客户端缓存
+9. **前端下拉菜单惰性加载 + 单向不可逆缓存失效**：当前页面从未新建标签时（`forceReloadLabelsList=false`），同一篇文章首次打开菜单 AJAX 拉取后可复用 DOM 缓存、零请求；一旦用户在当前页面新建任何标签，标志永久置为 `true`（代码中无任何地方会将其重置回 `false`），**当前页面后续每一次打开任何文章的标签菜单都会删除旧 DOM 并重新发 AJAX 请求，永不恢复 DOM 缓存复用**，根本原因是每篇文章的标签 `checked` 状态不同，客户端无法可靠缓存
 10. **未读数乐观回写**：AJAX 成功后直接更新 DOM 中 `data-unread` 属性，不等待页面刷新，保证用户体验流畅
 
 ### 10.2 数据流向图
