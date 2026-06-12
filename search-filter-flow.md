@@ -1006,3 +1006,514 @@ FreshRSS 的搜索过滤系统展现了优秀的软件架构设计：
 - 不跨越层级直接访问内部实现
 - 数据单向流动，无循环依赖
 - 每层可独立测试和替换
+
+---
+
+## 9. 过滤动作与搜索条件的协作：自动规则体系
+
+前面的三层架构分析侧重于"用户主动搜索→数据库查询→结果展示"这条路径。但 FreshRSS 还存在一条隐式路径：**自动规则（Filter Actions）**——它复用了同一套搜索条件模型，却在完全不同的时机和方式下工作。
+
+### 9.1 自动规则的完整生命周期
+
+自动规则由 `FreshRSS_FilterAction` 承载，将一条搜索条件与一组动作绑定：
+
+```
+FreshRSS_FilterAction {
+    booleanSearch: FreshRSS_BooleanSearch   // 复用搜索语法描述"哪些条目"
+    actions: ['read', 'star', 'label']     // 命中后执行的动作
+}
+```
+
+**存储位置**：`FilterAction` 被序列化为 JSON，保存在宿主对象的 `attributes.filters` 属性中。
+
+**宿主对象**（均使用 [FilterActionsTrait.php](file:///d:/fz/0601-1/solo-dogfeeding/code/24-FreshRSS/app/Models/FilterActionsTrait.php)）：
+
+| 宿主 | 类 | 规则作用域 |
+|------|------|-----------|
+| 用户全局配置 | [UserConfiguration.php](file:///d:/fz/0601-1/solo-dogfeeding/code/24-FreshRSS/app/Models/UserConfiguration.php) | 所有 Feed 的条目 |
+| 分类 | [Category.php](file:///d:/fz/0601-1/solo-dogfeeding/code/24-FreshRSS/app/Models/Category.php) | 该分类下所有 Feed 的条目 |
+| 订阅源 | [Feed.php](file:///d:/fz/0601-1/solo-dogfeeding/code/24-FreshRSS/app/Models/Feed.php) | 仅该 Feed 的条目 |
+| 标签 | [Tag.php](file:///d:/fz/0601-1/solo-dogfeeding/code/24-FreshRSS/app/Models/Tag.php) | 自动打标签规则 |
+
+### 9.2 搜索条件的复用方式——两条路径，同一模型
+
+同一套 `FreshRSS_BooleanSearch` + `FreshRSS_Search` 对象在两条路径中被复用，但匹配引擎截然不同：
+
+```
+                        FreshRSS_BooleanSearch
+                       ┌──────────┴──────────┐
+                       │                       │
+               路径A: SQL查询               路径B: 内存匹配
+               (用户主动搜索)             (自动规则)
+                       │                       │
+                       ▼                       ▼
+              EntryDAO::sqlBooleanSearch   Entry::matches()
+              将搜索对象转为SQL WHERE      将搜索对象逐字段与
+              子句，由数据库引擎执行        Entry对象属性对比，
+                                           由PHP在内存中执行
+```
+
+#### 路径A：SQL查询（用户主动搜索）
+
+[EntryDAO.php#L950-L1381](file:///d:/fz/0601-1/solo-dogfeeding/code/24-FreshRSS/app/Models/EntryDAO.php#L950-L1381)
+
+- **触发时机**：用户输入搜索词，请求文章列表
+- **执行者**：数据库引擎
+- **匹配方式**：搜索对象 → SQL WHERE 子句 → 数据库全表/索引扫描
+- **输出**：匹配的条目集合（Generator）
+- **特点**：批量高效，无需加载所有条目到内存
+
+#### 路径B：内存匹配（自动规则）
+
+[Entry.php#L645-L888](file:///d:/fz/0601-1/solo-dogfeeding/code/24-FreshRSS/app/Models/Entry.php#L645-L888)
+
+- **触发时机**：新条目入库时逐条匹配
+- **执行者**：PHP 运行时
+- **匹配方式**：逐字段对比 Entry 对象属性与搜索条件
+- **输出**：布尔值（是否匹配）
+- **特点**：单条精确，无需数据库查询
+
+**内存匹配的关键实现** [Entry.php#L645-L888](file:///d:/fz/0601-1/solo-dogfeeding/code/24-FreshRSS/app/Models/Entry.php#L645-L888)：
+
+```php
+public function matches(FreshRSS_BooleanSearch $booleanSearch): bool {
+    $ok = true;
+    foreach ($booleanSearch->searches() as $filter) {
+        if ($filter instanceof FreshRSS_BooleanSearch) {
+            // 递归处理嵌套布尔逻辑
+            match ($filter->operator()) {
+                'AND'     => $ok &= $this->matches($filter),
+                'OR'      => $ok |= $this->matches($filter),
+                'AND NOT' => $ok &= !$this->matches($filter),
+                'OR NOT'  => $ok |= !$this->matches($filter),
+            };
+        } elseif ($filter instanceof FreshRSS_Search) {
+            // 原子条件：逐字段对比
+            $ok = true;
+            if ($filter->getEntryIds() !== null) {
+                $ok &= in_array($this->id, $filter->getEntryIds(), true);
+            }
+            if ($ok && $filter->getIntitle() !== null) {
+                foreach ($filter->getIntitle() as $title) {
+                    $ok &= $databaseDao::strilike($this->title, $title, contains: true);
+                }
+            }
+            if ($ok && $filter->getIntext() !== null) {
+                foreach ($filter->getIntext() as $content) {
+                    $ok &= $databaseDao::strilike($this->content, $content, contains: true);
+                }
+            }
+            // ... 所有搜索条件的字段逐一对比
+            if ($ok) return true;  // OR语义：任一原子条件匹配即返回true
+        }
+    }
+    return (bool)$ok;
+}
+```
+
+**对比**：SQL 路径中 `intitle:php` 变成 `title LIKE '%php%'`，内存路径中同一条件变成 `$databaseDao::strilike($this->title, 'php', contains: true)`。语义一致，执行引擎不同。
+
+### 9.3 自动规则的触发时机与流程
+
+自动规则在两个关键时机触发：
+
+#### 9.3.1 条目入库时——标记已读/收藏
+
+[feedController.php#L703](file:///d:/fz/0601-1/solo-dogfeeding/code/24-FreshRSS/app/Controllers/feedController.php#L703)
+
+当 Feed 刷新获取到新条目（或更新已有条目）时：
+
+```
+Feed刷新 → 解析新条目 → Extension Hook (EntryBeforeInsert)
+                          │
+                          ▼
+               Entry::applyFilterActions()
+                          │
+            ┌─────────────┼─────────────┐
+            ▼             ▼             ▼
+   UserConfiguration   Category     Feed
+   .applyFilterActions  .applyFilter  .applyFilter
+   (全局规则)           (分类规则)     (Feed规则)
+            │             │             │
+            └──────┬──────┘             │
+                   ▼                    ▼
+         FilterActionsTrait::applyFilterActions()
+                   │
+                   ▼
+         遍历所有 FilterAction
+                   │
+                   ▼
+         Entry::matches(filterAction.booleanSearch())
+                   │
+            ┌──────┴──────┐
+            ▼ 匹配         ▼ 不匹配
+     执行 actions:     跳过
+     • 'read'  → entry._isRead(true)
+     • 'star'  → entry._isFavorite(true)
+     • 'label' → 设置 applyLabel=true（延迟处理）
+```
+
+[FilterActionsTrait.php#L125-L153](file:///d:/fz/0601-1/solo-dogfeeding/code/24-FreshRSS/app/Models/FilterActionsTrait.php#L125-L153)
+
+```php
+public function applyFilterActions(FreshRSS_Entry $entry, ?bool &$applyLabel = null): void {
+    $applyLabel = false;
+    foreach ($this->filterActions() as $filterAction) {
+        if ($entry->matches($filterAction->booleanSearch())) {
+            foreach ($filterAction->actions() as $action) {
+                switch ($action) {
+                    case 'read':
+                        if (!$entry->isRead()) {
+                            $entry->_isRead(true);
+                        }
+                        break;
+                    case 'star':
+                        if (!$entry->isUpdated()) {
+                            $entry->_isFavorite(true);
+                        }
+                        break;
+                    case 'label':
+                        if (!$entry->isUpdated()) {
+                            $applyLabel = true;
+                        }
+                        break;
+                }
+            }
+        }
+    }
+}
+```
+
+**优先级**：全局规则 → 分类规则 → Feed规则，三者依次执行，后者的结果可能覆盖前者。
+
+**安全约束**：`isUpdated()` 检查确保已更新的文章不会被自动标记为收藏或打标签，防止覆盖用户手动操作。
+
+#### 9.3.2 新条目提交后——自动打标签
+
+[feedController.php#L879-L901](file:///d:/fz/0601-1/solo-dogfeeding/code/24-FreshRSS/app/Controllers/feedController.php#L879-L901)
+
+标签动作的处理与其他动作不同——它不能在入库时立即执行（因为标签关联需要条目已持久化），所以延迟到 `commitNewEntries` 之后：
+
+```
+actualizeFeedsAndCommit()
+    │
+    ├─► actualizeFeeds()       ← 获取新条目，触发 applyFilterActions（read/star）
+    │
+    └─► commitNewEntries()     ← 将临时表数据提交到主表
+              │
+              └─► applyLabelActions()   ← 批量处理标签动作
+                      │
+                      ├─► 查询所有配置了 label 动作的 Tag
+                      ├─► 遍历最近入库的条目
+                      ├─► 对每个 Tag 调用 Tag.applyFilterActions(entry)
+                      └─► 批量执行 tagDAO.tagEntries($applyLabels)
+```
+
+```php
+private static function applyLabelActions(int $nbNewEntries): int|false {
+    $tagDAO = FreshRSS_Factory::createTagDao();
+    $labels = FreshRSS_Context::labels();
+    $labels = array_filter($labels, static fn(FreshRSS_Tag $label) =>
+        !empty($label->filtersAction('label')));
+    if (count($labels) <= 0) return 0;
+
+    $entryDAO = FreshRSS_Factory::createEntryDao();
+    $applyLabels = [];
+    foreach (FreshRSS_Entry::fromTraversable($entryDAO->selectAll(order: 'DESC', limit: $nbNewEntries)) as $entry) {
+        foreach ($labels as $label) {
+            $label->applyFilterActions($entry, $applyLabel);
+            if ($applyLabel) {
+                $applyLabels[] = ['id_tag' => $label->id(), 'id_entry' => $entry->id()];
+            }
+        }
+    }
+    return $tagDAO->tagEntries($applyLabels);
+}
+```
+
+### 9.4 过滤动作与搜索结果的协作边界
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                    搜索条件模型 (共享)                           │
+│         FreshRSS_BooleanSearch + FreshRSS_Search                │
+│                                                                  │
+│  定义"匹配什么"——与执行路径无关的纯条件描述                      │
+└───────────────┬──────────────────────────┬───────────────────────┘
+                │                          │
+        ┌───────┴───────┐          ┌───────┴───────┐
+        ▼               ▼          ▼               ▼
+   用户搜索路径    自动规则路径   FilterAction    Entry::matches()
+   (批量查询)     (逐条匹配)    (条件+动作绑定)  (内存匹配引擎)
+        │               │          │               │
+        ▼               ▼          ▼               ▼
+   sqlBooleanSearch  applyFilter  toJSON/fromJSON  strilike/preg_match
+   (SQL WHERE)       Actions()   (持久化)          (字段级对比)
+```
+
+**协作边界总结**：
+
+| 维度 | 用户搜索路径 | 自动规则路径 |
+|------|-------------|-------------|
+| 搜索条件来源 | HTTP请求 `search` 参数 | 宿主对象 `attributes.filters` |
+| 匹配引擎 | 数据库 SQL 引擎 | PHP 内存 `Entry::matches()` |
+| 匹配时机 | 用户请求时 | 条目入库时 |
+| 匹配粒度 | 批量（成千上万条） | 逐条 |
+| 输出 | 匹配条目的 Generator | 布尔值 → 触发动作 |
+| 可执行动作 | 无（纯筛选） | read / star / label |
+| 搜索条件接口 | `FreshRSS_BooleanSearch` 对象 | 同左（完全复用） |
+| 条件描述语言 | 同一套搜索语法 | 同一套搜索语法 |
+
+**关键设计**：搜索条件模型是纯值对象，不包含任何执行语义。它是两条路径之间的"共享契约"——无论 SQL 引擎还是 PHP 引擎，对同一搜索条件的匹配结果必须一致。
+
+---
+
+## 10. 搜索请求→上下文→取数→列表渲染：概念级说明
+
+### 10.1 端到端概念模型
+
+一次搜索请求从用户输入到页面呈现，经历四个概念阶段。每个阶段完成一项明确的转换，产出一个供下一阶段消费的结构：
+
+```
+┌─────────────┐     ┌─────────────┐     ┌─────────────┐     ┌─────────────┐
+│  ① 请求解析  │────►│  ② 条件装配  │────►│  ③ 数据获取  │────►│  ④ 列表渲染  │
+│             │     │             │     │             │     │             │
+│ HTTP参数 →  │     │ 搜索对象 +  │     │ SQL →       │     │ Generator → │
+│ 上下文状态  │     │ 查询上下文  │     │ Generator   │     │ HTML片段    │
+└─────────────┘     └─────────────┘     └─────────────┘     └─────────────┘
+   Controller          Context             DAO                View
+   负责                负责                负责                负责
+```
+
+### 10.2 阶段①：请求解析——从HTTP到上下文
+
+**职责**：将散列的HTTP参数收拢为类型安全的全局状态
+
+**入口**：[Context.php#L239-L317](file:///d:/fz/0601-1/solo-dogfeeding/code/24-FreshRSS/app/Models/Context.php#L239-L317) `updateUsingRequest()`
+
+**转换过程**：
+
+```
+HTTP Query String
+    ?search=intitle:php
+    &get=f_12
+    &state=2
+    &sort=date
+    &order=DESC
+    &nb=20
+    &cid=9876543210
+        │
+        ▼  逐一解析，赋值到静态属性
+FreshRSS_Context {
+    $search:    FreshRSS_BooleanSearch    ← 搜索语法解析在此触发
+    $get:       ['f', 12]                ← 浏览范围：Feed #12
+    $state:     STATE_NOT_READ           ← 文章状态过滤
+    $sort:      'date'                   ← 排序字段
+    $order:     'DESC'                   ← 排序方向
+    $number:    20                       ← 每页条数
+    $id_max:    '0'                      ← 安全上限（防无限回溯）
+    $continuation_id: '9876543210'       ← 游标分页起点
+    $sinceHours: 0                       ← 时间窗口限制
+}
+```
+
+**概念要点**：
+- **上下文是全局单例**：`FreshRSS_Context` 使用静态属性，整个请求生命周期共享
+- **搜索解析是急切的**：构造 `BooleanSearch` 时就完成全部语法解析，不延迟
+- **状态过滤与搜索条件正交**：`state`（已读/未读/收藏）与 `search`（关键词/字段过滤）是独立维度
+
+### 10.3 阶段②：条件装配——搜索对象与查询参数汇合
+
+**职责**：将上下文状态组装为DAO层可消费的参数集合
+
+**入口**：[indexController.php#L349-L413](file:///d:/fz/0601-1/solo-dogfeeding/code/24-FreshRSS/app/Controllers/indexController.php#L349-L413) `listEntriesByContext()`
+
+**转换过程**：
+
+```
+FreshRSS_Context 静态属性
+        │
+        ├─ $get → ['f', 12]     → $type='f', $id=12
+        │
+        ├─ $sinceHours           → $id_min = (time()-hours*3600).'000000'
+        │
+        ├─ $continuation_id      → 需查DAO获取游标条目的排序字段值
+        │   │
+        │   └─► entryDAO.searchById('9876543210')
+        │       → $pagingEntry → continuation_values = [1700000000]
+        │
+        └─ $search, $state, $sort, $order, $number...
+                │
+                ▼  原样传递给DAO
+        entryDAO.listWhere(
+            type:   'f',
+            id:     12,
+            state:  STATE_NOT_READ,
+            filters: BooleanSearch{intitle:['php']},
+            id_min: '1700000000000000',
+            id_max: '0',
+            sort:   'date',
+            order:  'DESC',
+            continuation_id: '9876543210',
+            continuation_values: [1700000000],
+            limit:  21          ← number+1，多取一条判断是否有下一页
+        )
+```
+
+**概念要点**：
+- **游标分页的额外查询**：使用非ID排序时，需要先查DAO获取上一页末条记录的排序字段值
+- **+1策略**：请求 N 条数据但查询 N+1 条，多出的一条仅用于判断是否有后续页
+- **搜索对象透传**：`BooleanSearch` 作为整体参数传入DAO，Controller不拆解其内部结构
+
+### 10.4 阶段③：数据获取——搜索对象转为SQL，查询并流式返回
+
+**职责**：将搜索对象和查询参数转换为安全的SQL，执行查询，以Generator返回
+
+**核心调用链**：
+
+```
+listWhere(type, id, state, filters, ...)
+    │
+    └─► sqlListWhere(type, id, state, filters, ...)
+            │
+            ├─► 构建基础WHERE（type → 优先级/分类/Feed/标签过滤）
+            │
+            └─► sqlListEntriesWhere(state, filters, id_min, id_max, sort, ...)
+                    │
+                    ├─► 构建状态过滤（is_read / is_favorite）
+                    ├─► 构建ID范围（id_min / id_max）
+                    ├─► 构建Keyset分页条件（continuation_id + sort values）
+                    │
+                    └─► sqlBooleanSearch(alias, filters)
+                            │
+                            ├─► 递归遍历 BooleanSearch 树
+                            │   ├─► BooleanSearch → AND/OR/AND NOT/OR NOT 组合
+                            │   └─► Search → 逐字段转SQL片段
+                            │       ├─ entry_ids    → id IN (?,?,?)
+                            │       ├─ feed_ids     → id_feed IN (?,?,?)
+                            │       ├─ category_ids → 子查询 IN (SELECT ...)
+                            │       ├─ label_ids    → EXISTS / 子查询
+                            │       ├─ intitle      → title LIKE ?
+                            │       ├─ intitle_regex→ REGEXP_LIKE(?,?) / REGEXP ?
+                            │       ├─ intext       → content LIKE ? / UNCOMPRESS + LIKE
+                            │       ├─ author       → author LIKE ?
+                            │       ├─ inurl        → link LIKE ?
+                            │       ├─ tags         → CONCAT + LIKE
+                            │       ├─ date         → id >= ? / id <= ?
+                            │       ├─ search       → title LIKE ? OR content LIKE ?
+                            │       └─ (not_* 版本→ NOT LIKE / NOT IN / NOT EXISTS)
+                            │
+                            └─► 返回 [values[], sqlFragment]
+```
+
+**最终SQL结构**（延迟关联模式）：
+
+```sql
+-- 外层：获取完整字段
+SELECT e0.id, e0.title, e0.author, UNCOMPRESS(e0.content_bin) AS content, ...
+FROM `_entry` e0
+INNER JOIN (
+    -- 内层：仅查ID，利用索引高效排序和分页
+    SELECT e.id
+    FROM `_entry` e
+    INNER JOIN `_feed` f ON f.id = e.id_feed
+    WHERE f.priority >= ?                    -- 优先级过滤
+      AND e.id_feed = ?                     -- Feed过滤
+      AND (e.is_read = 0)                   -- 状态过滤
+      AND e.id <= ?                         -- 安全上限
+      AND (e.date < ? OR (e.date = ? AND e.id <= ?))  -- Keyset分页
+      AND (e.title LIKE ?)                  -- 搜索条件
+    ORDER BY e.date DESC, e.id DESC
+    LIMIT 21
+) e2 ON e2.id = e0.id
+ORDER BY e0.date DESC, e0.id DESC
+```
+
+**概念要点**：
+- **延迟关联**：先在子查询中仅查ID（利用覆盖索引快速排序+分页），再关联外层获取完整数据
+- **参数化安全**：所有动态值通过 `?` 占位符和 `$values[]` 数组绑定，杜绝SQL注入
+- **数据库方言适配**：`sqlRegex()` 根据MariaDB/MySQL/SQLite/PostgreSQL选择不同正则实现
+- **搜索条件以AND嵌入**：`sqlBooleanSearch` 的结果通过 `AND (搜索片段)` 整体拼入主WHERE
+
+### 10.5 阶段④：列表渲染——Generator驱动流式输出
+
+**职责**：消费Generator，逐条渲染HTML，管理分页状态
+
+**入口**：[normal.phtml](file:///d:/fz/0601-1/solo-dogfeeding/code/24-FreshRSS/app/views/index/normal.phtml)
+
+**转换过程**：
+
+```
+callbackBeforeEntries($view)
+    │
+    └─► listEntriesByContext(number+1)
+            │
+            └─► entryDAO.listWhere(...) → Generator<FreshRSS_Entry>
+                    │
+                    ▼ 赋值到 $view->entries
+        ob_start()  ← 开启输出缓冲（逐条刷新）
+
+foreach ($this->entries as $item):
+    │
+    ├─► Extension Hook: EntryBeforeDisplay    ← 扩展可修改/过滤条目
+    │
+    ├─► transition($item)                     ← 生成分组过渡标题
+    │   │                                       （"今天 — 2024-01-15"）
+    │   └─► transitionLink($item)              ← 过渡标题的锚点链接
+    │
+    ├─► 渲染 <article> HTML                    ← 单条文章的完整呈现
+    │
+    ├─► ob_flush()                             ← 逐条刷新到浏览器
+    │
+    └─► $nbEntries++; $lastEntry = $item;
+
+callbackBeforePagination($view, $nbEntries, $lastEntry)
+    │
+    ├─► if ($nbEntries > $number):
+    │       $continuation_id = $lastEntry->id()   ← 设置下一页游标
+    │       ob_clean()                             ← 丢弃多取的那一条
+    │   else:
+    │       $continuation_id = '0'                 ← 无更多数据
+    │
+    └─► ob_end_flush()                            ← 关闭缓冲，输出全部内容
+
+渲染分页导航栏 ← 基于 $continuation_id 生成"加载更多"链接
+```
+
+**概念要点**：
+- **Generator驱动渲染**：视图模板不持有全部数据，而是在 `foreach` 中逐条从Generator拉取
+- **输出缓冲策略**：`ob_start()` / `ob_clean()` / `ob_end_flush()` 配合 +1 策略，多取的条目被丢弃
+- **过渡分组**：根据排序字段（日期/分类/Feed名称）自动生成分组标题
+- **Keyset分页闭环**：`continuation_id` 取自最后一条的ID，嵌入下一页请求的 `cid` 参数
+
+### 10.6 四阶段概念总结
+
+```
+     ① 请求解析           ② 条件装配           ③ 数据获取           ④ 列表渲染
+     ─────────           ─────────           ─────────           ─────────
+入   HTTP参数            Context状态          DAO参数集合          Generator
+出   Context状态         DAO参数集合          Generator           HTML页面
+核   参数类型化           参数聚合补充         SQL构建+执行        流式渲染+分页
+心                                        参数绑定安全
+动   search→解析          游标值补充          搜索→WHERE           过渡标题
+作   get→类型+ID          +1策略              延迟关联             缓冲控制
+     state→位掩码                             方言适配             分页导航
+```
+
+**端到端数据形态变迁**：
+
+```
+字符串 "intitle:php"          ← HTTP参数
+    │
+    ▼ 解析
+BooleanSearch 对象树          ← 请求解析阶段产物
+    │
+    ▼ SQL转换
+"AND (title LIKE '%php%')"    ← 数据获取阶段产物
+    │
+    ▼ 查询执行
+PDOStatement → Generator     ← 数据获取阶段产物
+    │
+    ▼ 模板渲染
+<article>…</article>          ← 列表渲染阶段产物
+```
