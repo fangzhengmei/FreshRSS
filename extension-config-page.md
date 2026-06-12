@@ -520,7 +520,17 @@ private function setConfiguration(string $type, array $configuration): void {
 ④ opcache_invalidate(config.php)                        清理 opcode 缓存
 ```
 
-如果 `handleConfigureAction()` 在 `save()` 之后抛异常（例如扩展在 save 之后还做了别的验证），最坏情况是"配置已经写入但异常被抛出"。不过由于步骤①-③保证写入原子性，磁盘上的配置文件要么是完整的新版本，要么是完整的旧版本，绝不会出现半写入的损坏 PHP 数组（那会导致下次 include 时整站崩溃）。
+**关键：catch 块不回滚已写入的持久化状态。** `handleConfigureAction()` 内部的两种写入操作——`setUserConfigurationValue()` 最终调用 `$conf->save()`（[Extension.php#L443](file:///d:/fz/0601-1/solo-dogfeeding/code/28-FreshRSS/lib/Minz/Extension.php#L443)）和 `saveFile()` 调用 `file_put_contents()`（[Extension.php#L547](file:///d:/fz/0601-1/solo-dogfeeding/code/28-FreshRSS/lib/Minz/Extension.php#L547)）——都是同步写磁盘的。一旦执行成功，数据就落盘了。而 [configureAction() 的 catch 块](file:///d:/fz/0601-1/solo-dogfeeding/code/28-FreshRSS/app/Controllers/extensionController.php#L147-L150)只做了两件事：记日志 + `Minz_Request::bad()`（即 session flash + `header('Location: ...')` + `exit()`），**没有任何代码去撤销已完成的 `save()` 或 `saveFile()`**。
+
+因此，配置失败时的持久化结果取决于异常发生的时机：
+
+| 异常时机 | 磁盘状态 | 示例场景 |
+|---|---|---|
+| 在 `save()` / `saveFile()` **之前**抛出 | 磁盘不变，等同于未提交 | 扩展先做输入校验，校验不通过抛异常 |
+| 在 `save()` / `saveFile()` **之后**抛出 | 磁盘已更新，**不回滚** | 扩展 save 后继续做二次验证或后续操作时失败 |
+| `save()` 本身失败（返回 `false`） | 磁盘不变（`save()` 内部 `unlink` 临时文件） | 磁盘满、权限不足 |
+
+`save()` 的三步写入协议（tmp → bak → rename）保证的是**单次写入的原子性**：不会出现半写入的损坏 PHP 数组（那会导致下次 `include` 时整站崩溃）。但它不提供事务性——如果扩展在 save 之后又抛异常，新的配置值已经持久化在磁盘上，catch 块不会把它恢复到旧值。配置文件目录下会保留 `.bak.php` 备份文件（`save()` 步骤②的产物），管理员可以手动恢复，但框架不会自动做这件事。
 
 #### 隔离层三：文件存储沙箱 + 路径净化
 
@@ -551,7 +561,7 @@ final public function getExtensionUserPath(): string {
 |---|---|---|
 | 捕获异常类型 | `Minz_Exception` | `Minz_Exception` |
 | 故障恢复方式 | 自动禁用该扩展，下一次请求再次尝试 | 重定向到列表页，用户手动重试 |
-| 持久化状态 | 不回滚配置（保留启用标记） | 不保存配置（回滚到之前状态） |
+| 持久化状态 | 不回滚配置（保留启用标记） | 视 save 时机：save 前异常则磁盘不变；save 后异常则已持久化，**不回滚** |
 | 内存状态 | 从 `$ext_list_enabled` 移除 | 不改变启用状态 |
 | 用户反馈 | 仅日志 | 日志 + 页面错误提示 + 日志页面链接 |
 | 故障影响范围 | 该扩展对所有操作不可用 | 仅本次配置保存失败，扩展其他功能正常 |
