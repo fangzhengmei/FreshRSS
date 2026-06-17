@@ -185,9 +185,11 @@ public function loadCompleteContent(bool $force = false): bool {
             // 4. 根据 content_action 策略合并
             switch ($feed->attributeString('content_action')) {
                 case 'prepend':  // 全文在前，摘要在后
+                    $this->_attribute('original_content');
                     $this->content = $fullContent . $originalContent;
                     break;
                 case 'append':   // 摘要在前，全文在后
+                    $this->_attribute('original_content');
                     $this->content = $originalContent . $fullContent;
                     break;
                 case 'replace':  // 用全文替换摘要（默认）
@@ -200,12 +202,64 @@ public function loadCompleteContent(bool $force = false): bool {
         }
     } 
     // 【分支B】仅使用 path_entries_filter 过滤已有内容
-    elseif (trim($feed->attributeString('path_entries_filter')) !== '') {
+    elseif (trim($feed->attributeString('path_entries_filter') ?? '') !== '') {
         // 对 RSS 原内容执行 CSS 选择器过滤（不发HTTP请求）
     }
     // 【分支C】不做任何全文处理，保持 RSS 摘要
     return false;
 }
+```
+
+### 3.1.1 强制重抓（`$force=true`）与多层缓存的交互
+
+`loadCompleteContent(bool $force = false)` 中的 `$force` 参数是强制重抓的总开关，但它与各层缓存的交互非常精细：
+
+#### `$force=true` 的触发场景（3 处调用）
+
+| 场景 | 文件位置 | 说明 |
+|------|----------|------|
+| 文章内容已更新（hash 变化） | [feedController.php#L682](app/Controllers/feedController.php#L682) | `if (strcasecmp($existingHash, $entry->hash()) !== 0)` → `$entry->loadCompleteContent(true);` |
+| 手动点击"重新加载"按钮 | [feedController.php#L1248](app/Controllers/feedController.php#L1248) | `reloadAction` 遍历 DB 中已有文章，逐篇强制重抓 |
+| 新 Feed 添加 `$feedIsNew=true` | [feedController.php#L567](app/Controllers/feedController.php#L567) | `$simplePie = $feed->load(false, $feedIsNew);` 强制 Feed 级缓存失效 |
+
+#### 四层缓存对 `$force` 的不同响应
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                   $force=true 对缓存的穿透能力                   │
+├──────────────┬──────────────────────────────┬────────────────────┤
+│ 缓存层级     │ $force=true 时是否穿透       │ 代码位置           │
+├──────────────┼──────────────────────────────┼────────────────────┤
+│ Layer 4 DB   │ ✅ 完全穿透（不复用DB内容）  │ Entry.php#L1072    │
+│              │  $force ? null : searchByGuid()                    │
+├──────────────┼──────────────────────────────┼────────────────────┤
+│ Layer 3      │ ❌ 不穿透（仍检查限流）      │ httpUtil.php#L307  │
+│ Retry-After  │  getRetryAfter() 检查生效                        │
+├──────────────┼──────────────────────────────┼────────────────────┤
+│ Layer 2      │ ❌ 不穿透（仍读文件缓存）    │ httpUtil.php#L275  │
+│ HTTP HTML    │  cacheMtime 检查依然生效                          │
+├──────────────┼──────────────────────────────┼────────────────────┤
+│ Layer 1      │ ⚠️  部分穿透（Feed 级）      │ Feed.php#L684      │
+│ SimplePie    │  $noCache || SimplePieHash 变化则返回非 null       │
+└──────────────┴──────────────────────────────┴────────────────────┘
+```
+
+**关键洞察**：
+- `$force=true` **仅跳过 Layer 4 数据库内容复用**，HTTP 文件缓存（Layer 2）和 Retry-After 限流（Layer 3）依然生效
+- 若要真正重新抓取网页，需同时调用 `$feed->clearCache()` 删除 `.spc` 和 `.html` 文件，或等待 `limits.cache_duration` 过期
+- Feed 级 `$noCache` [Feed.php#L601, L684](app/Models/Feed.php#L601-L684) 仅影响 SimplePieHash 比较逻辑，不删除 SimplePie 的 `.spc` 缓存文件（避免多用户场景下缓存失效）
+
+#### 真正清除所有缓存的方式
+
+```php
+// 1. 清除 SimplePie + HTTP 缓存文件（Feed 级）
+$feed->clearCache();   // Feed.php#L1327-L1330
+
+// 2. 清除 Feed 级的 SimplePieHash，强制 Feed::load 返回非 null
+$feed->_attribute('SimplePieHash', '');
+
+// 3. 强制 DB 级的全文重抓（单篇文章级）
+$entry->loadCompleteContent(true);   // 跳过 searchByGuid 复用
 ```
 
 ### 3.2 触发全文抓取的**必要条件**
@@ -261,7 +315,42 @@ $html = $response['body'];
 
 #### Step 3：页面重定向处理（HTTP 301/302 + HTML meta refresh）
 
-这是本文档重点补充的部分。全文抓取会遇到两类重定向，代码分两层处理：
+这是本文档重点补充的部分。全文抓取会遇到两类重定向，代码分两层处理，并通过 `$maxRedirs` 参数精细控制总跳转次数。
+
+##### `$maxRedirs` 的完整传递与递减机制
+
+函数签名定义默认总预算为 **4 次**：
+
+```php
+// Entry.php#L924
+public function getContentByParsing(string $url = '', int $maxRedirs = 4): string {
+```
+
+**调用链与递减过程**：
+
+```
+初始调用（无显式 maxRedirs）
+    ↓
+getContentByParsing()              $maxRedirs = 4
+    │
+    ├─ httpGet() → cURL 自动跟随 N 次 301/302
+    │                  → 返回 redirect_count = N
+    │
+    ├─ $maxRedirs -= N              $maxRedirs = 4 - N
+    │
+    ├─ 若 $maxRedirs > 0，扫描 <meta refresh>
+    │   找到跳转 URL
+    │        ↓
+    └─ 递归 getContentByParsing(newUrl, $maxRedirs - 1)
+                                     $maxRedirs = (4 - N) - 1
+```
+
+**命中 HTTP 文件缓存时的特殊处理** [httpUtil.php#L281](app/Utils/httpUtil.php#L281)：
+```php
+// 若 HTTP 缓存命中（status=-200），redirect_count 固定返回 0
+return ['body' => $body, 'effective_url' => $url, 'redirect_count' => 0, ...];
+```
+> 注意：缓存命中时没有实际的 HTTP 请求，`effective_url` 就是原始 URL，`redirect_count` 为 0，意味着缓存后的 meta refresh 检查有完整的 4 次预算。
 
 ##### Layer A：HTTP 协议级重定向（301/302）
 
@@ -270,7 +359,7 @@ $html = $response['body'];
 ```php
 curl_setopt_array($ch, [
     CURLOPT_URL => $url,
-    CURLOPT_MAXREDIRS => 4,           // 最多 4 次 HTTP 重定向
+    CURLOPT_MAXREDIRS => 4,           // cURL 层面最多 4 次 HTTP 重定向
     CURLOPT_FOLLOWLOCATION => true,   // 自动跟随 301/302
     CURLOPT_ACCEPT_ENCODING => '',    // 启用 gzip/deflate/br
 ]);
@@ -282,11 +371,25 @@ if (defined('CURLOPT_PROTOCOLS_STR')) {
 }
 ```
 
+**用户自定义 CURLOPT_MAXREDIRS**：
+- Feed 级别的 `curl_params` 可覆盖默认值 4
+- OPML 导入/导出支持 `frss:CURLOPT_MAXREDIRS` 属性 [opml.phtml#L122](app/views/helpers/export/opml.phtml#L122)
+- 表单编辑位于 [update.phtml#L812](app/views/helpers/feed/update.phtml#L812)
+
 cURL 请求完成后，获取最终落地 URL 与跳转次数：
 
 ```php
+// httpUtil.php#L390-L391
 $c_effective_url  = curl_getinfo($ch, CURLINFO_EFFECTIVE_URL);   // 最终 URL
 $c_redirect_count = curl_getinfo($ch, CURLINFO_REDIRECT_COUNT);  // 实际跳转了几次
+
+// 返回给调用者
+return [
+    'body' => $body,
+    'effective_url' => $c_effective_url,
+    'redirect_count' => $c_redirect_count,  // 传递已用次数
+    // ...
+];
 ```
 
 ##### Layer B：HTML meta refresh 重定向（JS 跳转的替代方案）
@@ -317,7 +420,7 @@ if ($maxRedirs > 0) {
                 : false;
 
             if ($refresh != false && $refresh !== $url) {
-                // 递归调用自身，重定向预算 -1
+                // 递归调用自身，重定向预算 -1（meta 自身也算一次跳转）
                 return $this->getContentByParsing($refresh, $maxRedirs - 1);
             }
         }
@@ -329,8 +432,8 @@ if ($maxRedirs > 0) {
 
 | 阶段 | 预算来源 | 最大次数 | 说明 |
 |------|----------|----------|------|
-| HTTP 301/302 | cURL CURLOPT_MAXREDIRS | 4 | 自动跟随，仅 http/https |
-| HTML meta refresh | `$maxRedirs` 参数（初值 4）减去 HTTP 已用 | 剩余 | DOM 扫描后递归 |
+| HTTP 301/302 | cURL CURLOPT_MAXREDIRS（默认 4） | 4 | 自动跟随，仅 http/https，次数计入总预算 |
+| HTML meta refresh | `$maxRedirs` 参数（初值 4）减去 HTTP 已用 | 剩余 | DOM 扫描后递归，每次递归预算 -1 |
 
 ##### 重定向后 base href 的计算
 
@@ -522,21 +625,113 @@ $cachePath = $feed->cacheFilename($url . '#' . $feed->pathEntries());
 
 代码实现参考 [Entry.php#L1083-L1097](app/Models/Entry.php#L1083-L1097)。
 
-### 5.2 内容标记与恢复
+### 5.2 `original_content` 属性的完整生命周期
 
-**标记全文内容**：
+`original_content` 是存储 RSS 原始摘要的关键属性，贯穿全文抓取的写入、读取、序列化、恢复等完整生命周期。
+
+#### 写入时机（5 处调用 `_attribute('original_content')`）
+
+所有写入操作位于 [Entry.php#L1085-L1133](app/Models/Entry.php#L1085-L1133)：
+
+| 场景 | 代码 | 说明 |
+|------|------|------|
+| `content_action = 'prepend'` | `$this->_attribute('original_content');` | **清除**该属性（仅保留 content 拼接结果） |
+| `content_action = 'append'` | `$this->_attribute('original_content');` | **清除**该属性（仅保留 content 拼接结果） |
+| `content_action = 'replace'` | `$this->_attribute('original_content', $originalContent);` | **保存** RSS 原始摘要到 attributes |
+| `path_entries_filter` 过滤时 | `$this->_attribute('original_content');` | 先清除旧值 |
+| 过滤后内容变化时 | `$this->_attribute('original_content', $originalContent);` | **保存**过滤前的内容 |
+
+```php
+// 核心代码片段
+switch ($feed->attributeString('content_action')) {
+    case 'prepend':
+    case 'append':
+        $this->_attribute('original_content');  // 无参数 = 清除
+        $this->content = $fullContent . $originalContent;
+        break;
+    case 'replace':
+    default:
+        $this->_attribute('original_content', $originalContent);  // 保存
+        $this->content = $fullContent;
+        break;
+}
+```
+
+#### 读取与恢复
+
+`originalContent()` 方法 [Entry.php#L210-L213](app/Models/Entry.php#L210-L213) 实现**双重保险**的恢复机制：
+
+```php
+public function originalContent(): string {
+    return $this->attributeString('original_content') ??      // ① 优先从 attributes 读取
+        preg_replace('#<!-- FULLCONTENT start //-->.*<!-- FULLCONTENT end //-->#s', 
+            '', $this->content) ?? '';                        // ② 失败则正则移除 FULLCONTENT 注释块
+}
+```
+
+> 设计意图：即使 `original_content` 属性意外丢失（如数据库迁移），仍可通过正则解析 `content` 字段恢复原始摘要，保证数据可逆。
+
+#### 哈希计算中的角色
+
+`hash()` 方法 [Entry.php#L513-L520](app/Models/Entry.php#L513-L520) 将 `originalContent()` 纳入 MD5 计算：
+
+```php
+$this->hash = md5(
+    $this->link . $this->title . $this->authors(true) . 
+    $this->originalContent() . $this->tags(true) . $attributes
+);
+```
+
+这意味着：
+- RSS 原始摘要变化 → hash 变化 → 触发 `loadCompleteContent(true)` 强制重抓全文
+- 即使全文抓取失败或被禁用，RSS 摘要的更新依然能被正确检测
+
+#### 数据库序列化
+
+`toArray()` 方法 [Entry.php#L1152-L1171](app/Models/Entry.php#L1152-L1171) 将整个 `attributes` 数组（含 `original_content`）序列化到 DB：
+
+```php
+public function toArray(): array {
+    return [
+        // ... 其他字段
+        'content' => $this->content(false),  // 不含 enclosures 的合并后内容
+        'attributes' => $this->attributes(), // 含 original_content 的 JSON
+    ];
+}
+```
+
+最终存储于 `_entry.attributes` 字段（JSON 格式），`original_content` 作为其中的一个键。
+
+#### 特殊分支：取消全文抓取后的恢复
+
+当用户之前为 Feed 配置了全文抓取，之后取消（`pathEntries` 变空），代码会自动恢复原始内容 [Entry.php#L1137-L1141](app/Models/Entry.php#L1137-L1141)：
+
+```php
+} else {
+    // pathEntries 和 path_entries_filter 都为空
+    $originalContent = $this->originalContent();
+    if ($originalContent !== $this->content) {
+        $this->content = $originalContent;  // 恢复为 RSS 原始摘要
+        return true;
+    }
+}
+```
+
+#### FULLCONTENT 注释标记
+
+全文内容在存入 `content` 前会用 HTML 注释包裹，便于正则恢复：
+
 ```php
 $fullContent = "<!-- FULLCONTENT start //-->{$fullContent}<!-- FULLCONTENT end //-->";
 ```
 
-**恢复原始内容**（如需）：
-```php
-public function originalContent(): string {
-    return $this->attributeString('original_content') ??
-        preg_replace('#<!-- FULLCONTENT start //-->.*<!-- FULLCONTENT end //-->#s', 
-            '', $this->content) ?? '';
-}
-```
+三种合并策略下 `content` 字段的最终内容：
+
+| 策略 | content 字段内容 |
+|------|-----------------|
+| `replace`（默认） | `<!-- FULLCONTENT start //-->全文<!-- FULLCONTENT end //-->` |
+| `prepend` | `<!-- FULLCONTENT start //-->全文<!-- FULLCONTENT end //-->RSS摘要` |
+| `append` | `RSS摘要<!-- FULLCONTENT start //-->全文<!-- FULLCONTENT end //-->` |
 
 ### 5.3 入数据库
 
@@ -641,7 +836,7 @@ private static function enclosureIsImage(array $enclosure): bool {
 }
 ```
 
-#### 完整渲染流程（含去重）
+#### 完整渲染流程（含去重 + length 输出）
 
 ```php
 public function content(bool $withEnclosures = true, bool $allowDuplicateEnclosures = false): string {
@@ -710,17 +905,17 @@ public function content(bool $withEnclosures = true, bool $allowDuplicateEnclosu
 
         // 2b. 根据类型渲染主 enclosure（4 类）
         if (self::enclosureIsImage(['url' => $elink, 'length' => $length, 'medium' => $medium, 'type' => $mime])) {
-            // 图片：直接 <img> 嵌入
+            // 图片：直接 <img> 嵌入（无 data-length）
             $content .= '<p class="enclosure-content"><img src="' . $elink
                 . '" alt="" title="' . $etitle . '" /></p>';
         } elseif ($medium === 'audio' || str_starts_with($mime, 'audio')) {
-            // 音频：<audio controls> + 下载图标
+            // 音频：<audio controls> + 下载图标，带 data-length 属性
             $content .= '<p class="enclosure-content"><audio preload="none" src="' . $elink
                 . ($length === null ? '' : '" data-length="' . $length)
                 . ($mime == '' ? '' : '" data-type="' . htmlspecialchars($mime, ENT_COMPAT, 'UTF-8'))
                 . '" controls="controls" title="' . $etitle . '"></audio> <a download="" href="' . $elink . '">💾</a></p>';
         } elseif ($medium === 'video' || str_starts_with($mime, 'video')) {
-            // 视频：<video controls> + 下载图标
+            // 视频：<video controls> + 下载图标，带 data-length 属性
             $content .= '<p class="enclosure-content"><video preload="none" src="' . $elink
                 . ($length === null ? '' : '" data-length="' . $length)
                 . ($mime == '' ? '' : '" data-type="' . htmlspecialchars($mime, ENT_COMPAT, 'UTF-8'))
@@ -754,7 +949,65 @@ public function content(bool $withEnclosures = true, bool $allowDuplicateEnclosu
 }
 ```
 
-**展示层的最终内容** = `[RSS摘要 + 全文]（按策略合并） + [缩略图 enclosure（去重）] + [附件 enclosures（去重 + 按类型渲染 + description/credit）]`
+**展示层的最终内容** = `[RSS摘要 + 全文]（按策略合并） + [缩略图 enclosure（去重）] + [附件 enclosures（去重 + 按类型渲染 + length/type/description/credit）]`
+
+#### 展示层 `length` 信息输出（`data-length` 属性）
+
+`enclosure['length']` 来自 RSS `<media:content length="...">`，在 FreshRSS 中有完整的读写闭环：
+
+##### 数据流向
+
+```
+SimplePie 解析 <media:content length="1234567">
+    ↓ 存入
+_entry.attributes.enclosures[n].length = 1234567
+    ↓ 读取（Entry::content()）
+$length = (int)$enclosure['length']  →  1234567
+    ↓ 输出到 HTML
+<audio data-length="1234567" ...> 或 <video data-length="1234567" ...>
+    ↓ 反向解析（Entry::enclosures()）
+$enclosure['length'] = (int)$element->getAttribute('data-length')
+```
+
+##### 输出规则（仅音频/视频有 length 输出）
+
+| 附件类型 | data-length 输出？ | 代码位置 |
+|----------|-------------------|----------|
+| 图片（image） | ❌ 无 | [Entry.php#L727-L728](app/Models/Entry.php#L727-L728) |
+| 音频（audio） | ✅ 有 | [Entry.php#L732-L734](app/Models/Entry.php#L732-L734) |
+| 视频（video） | ✅ 有 | [Entry.php#L737-L739](app/Models/Entry.php#L737-L739) |
+| 通用附件（其它） | ❌ 无 | [Entry.php#L741-L745](app/Models/Entry.php#L741-L745) |
+
+**条件判断代码**：
+```php
+// $length 为 null 时不输出该属性（兼容旧数据）
+($length === null ? '' : '" data-length="' . $length)
+```
+
+> **用途**：`data-length` 是 HTML5 自定义数据属性，供前端 JavaScript 读取（如显示文件大小、计算播放进度条百分比等）。FreshRSS 自身不使用该值，仅作为元数据透传给前端。
+
+##### 反向解析（从 HTML 提取 enclosure）
+
+`Entry::enclosures()` 方法 [Entry.php#L340-L344](app/Models/Entry.php#L340-L344) 可以从已渲染的 HTML 中反向解析 enclosure，包括从 `data-length` 恢复 length：
+
+```php
+$result = [
+    'url'    => $enclosure->getAttribute('src'),
+    'type'   => $enclosure->getAttribute('data-type'),
+    'medium' => $enclosure->getAttribute('data-medium'),
+    'length' => (int)($enclosure->getAttribute('data-length')),  // ← 反向提取
+];
+```
+
+##### `enclosureIsImage()` 中的 length 角色
+
+`length` 还参与图片类型判定（兜底策略）：
+```php
+// Entry.php#L203-L204
+($mime == '' && $length == 0           // 无 MIME + 无大小
+    && preg_match('/[.](avif|gif|jpe?g|png|svg|webp)([?#]|$)/i', $elink))
+```
+> 当 enclosure 既没有 MIME 类型也没有文件大小时，才尝试通过 URL 扩展名猜测是否为图片。
 
 ### 6.3 RSS 输出模板中的附件去重
 
@@ -982,7 +1235,7 @@ feedController::actualizeFeeds()
   │
   └─ $entry->content(true)
        │
-       ├─ 读取 DB 中已合并的 content
+       ├─ 读取 DB 中已合并的 content（含 original_content 属性）
        │
        ├─ 【thumbnail 去重】containsLink(content, thumb_url)? 是→跳过
        │
@@ -990,9 +1243,10 @@ feedController::actualizeFeeds()
             ├─ 【enclosure URL 去重】containsLink(content, enclosure_url)? 是→跳过
             ├─ 读取 enclosure.description → nl2br
             ├─ 读取 enclosure.credit → © 前缀
+            ├─ 读取 enclosure.length → 仅 audio/video 输出为 data-length
             ├─ enclosureIsImage()? → <img>
-            ├─ 是 audio? → <audio controls> + 💾
-            ├─ 是 video? → <video controls> + 💾
+            ├─ 是 audio? → <audio controls data-length="N"> + 💾
+            ├─ 是 video? → <video controls data-length="N"> + 💾
             └─ 其它? → 💾 下载图标
             └─ (credit + description) → <figure> 内 <p> + <figcaption>
 ```
@@ -1010,10 +1264,12 @@ feedController::actualizeFeeds()
 | `ttl_default` | 用户配置 | - | Feed 默认刷新周期 |
 | `pubsubhubbub_enabled` | 系统配置 | true | 是否启用 WebSub 实时推送 |
 | `curl_options` | 系统配置 | [] | 全局代理、SSL 配置等 |
+| `CURLOPT_MAXREDIRS` | Feed curl_params | 4 | HTTP 301/302 最大重定向次数，OPML 支持 `frss:CURLOPT_MAXREDIRS` |
 | `content_action` | Feed attributes | `replace` | 全文合并策略 |
 | `pathEntries` | Feed 属性 | `''` | **全文抓取开关 + CSS 选择器** |
 | `path_entries_filter` | Feed attributes | `''` | 需要移除的节点 CSS 选择器 |
 | `path_entries_conditions` | Feed attributes | `[]` | 触发全文抓取的搜索条件数组 |
+| `original_content` | Entry attributes | 动态 | 保存 RSS 原始摘要，支持恢复与 hash 计算 |
 | `content_width` | 用户显示配置 | - | 展示层内容宽度样式 |
 | `lazyload` | 用户配置 | true | 图片懒加载 |
 
@@ -1046,11 +1302,27 @@ feedController::actualizeFeeds()
 - HTTP 301/302 由 cURL 自动跟随（最多 4 次，限 http/https）
 - `<meta http-equiv="refresh">` 由 Entry.php 递归解析（剩余预算 = 4 - HTTP 已用）
 - base href 以重定向后最终 URL 为准
+- 命中 HTTP 文件缓存时 redirect_count=0，meta refresh 有完整 4 次预算
 
 ### 场景 7：RSS 正文中已嵌有 enclosure 的图片
 - `containsLink()` 正则扫描正文 HTML 中是否已有相同 URL
 - 已有则 enclosure 不重复追加，避免图片重复显示
 - RSS 输出模板使用哈希表对 enclosure URL 去重
+
+### 场景 8：强制重抓 `$force=true` 但 HTTP 缓存仍生效
+- `loadCompleteContent(true)` 仅跳过 Layer 4 DB 内容复用
+- Layer 2 HTTP 文件缓存（`.html`）和 Layer 3 Retry-After 仍检查
+- 需同时调用 `$feed->clearCache()` 才能真正重新请求网页
+
+### 场景 9：取消全文抓取配置后自动恢复
+- 用户删除 `pathEntries` 配置后，下次刷新触发恢复分支
+- 代码自动读取 `originalContent()` 恢复为 RSS 原始摘要
+- 双重保险机制：优先读 attributes.original_content，失败则正则移除 FULLCONTENT 注释
+
+### 场景 10：HTTP 重定向次数用尽但仍有 meta refresh
+- 若 cURL 已用完 4 次 301/302 跳转，`$maxRedirs` 变为 0
+- 即使页面有 `<meta refresh>`，也会停止递归防止死循环
+- 总跳转次数 = HTTP 重定向次数 + HTML meta refresh 次数 ≤ 4
 
 ---
 
