@@ -1,6 +1,6 @@
 # FreshRSS 全文抓取工作流程
 
-本文档梳理 FreshRSS 中 RSS 全文抓取的完整代码流转，包括触发条件、正文清洗与缓存、以及展示层合并策略。
+本文档梳理 FreshRSS 中 RSS 全文抓取的完整代码流转，包括触发条件、正文清洗与缓存、展示层合并策略，以及页面重定向、附件去重、描述渲染等细节。
 
 ---
 
@@ -16,13 +16,13 @@
 
 | 组件 | 文件路径 | 职责 |
 |------|----------|------|
-| 实际化脚本 | [actualize_script.php](file:///d:/fz/0601-2/solo-dogfeeding/code/28-FreshRSS/app/actualize_script.php) | CLI 定时刷新入口 |
-| Feed 控制器 | [feedController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/28-FreshRSS/app/Controllers/feedController.php) | 触发 actualize 动作 |
-| Feed 模型 | [Feed.php](file:///d:/fz/0601-2/solo-dogfeeding/code/28-FreshRSS/app/Models/Feed.php) | 订阅源加载、条目解析、缓存管理 |
-| Entry 模型 | [Entry.php](file:///d:/fz/0601-2/solo-dogfeeding/code/28-FreshRSS/app/Models/Entry.php) | 全文抓取 `loadCompleteContent()`、内容解析 `getContentByParsing()` |
-| SimplePie 定制 | [SimplePieCustom.php](file:///d:/fz/0601-2/solo-dogfeeding/code/28-FreshRSS/app/Models/SimplePieCustom.php) | HTML 内容清洗 `sanitizeHTML()` |
-| HTTP 工具 | [httpUtil.php](file:///d:/fz/0601-2/solo-dogfeeding/code/28-FreshRSS/app/Utils/httpUtil.php) | HTTP 请求、缓存层、编码处理 |
-| 视图层 | [normal.phtml](file:///d:/fz/0601-2/solo-dogfeeding/code/28-FreshRSS/app/views/index/normal.phtml) | 内容展示 `$entry->content(true)` |
+| 实际化脚本 | [actualize_script.php](app/actualize_script.php) | CLI 定时刷新入口 |
+| Feed 控制器 | [feedController.php](app/Controllers/feedController.php) | 触发 actualize 动作 |
+| Feed 模型 | [Feed.php](app/Models/Feed.php) | 订阅源加载、条目解析、缓存管理 |
+| Entry 模型 | [Entry.php](app/Models/Entry.php) | 全文抓取 `loadCompleteContent()`、内容解析 `getContentByParsing()` |
+| SimplePie 定制 | [SimplePieCustom.php](app/Models/SimplePieCustom.php) | HTML 内容清洗 `sanitizeHTML()` |
+| HTTP 工具 | [httpUtil.php](app/Utils/httpUtil.php) | HTTP 请求、缓存层、编码与重定向处理 |
+| 视图层 | [normal.phtml](app/views/index/normal.phtml) | 内容展示 `$entry->content(true)` |
 
 ---
 
@@ -32,7 +32,7 @@
 
 #### 入口 1：CLI 定时任务（最常用）
 
-**文件**: [actualize_script.php#L13-L16](file:///d:/fz/0601-2/solo-dogfeeding/code/28-FreshRSS/app/actualize_script.php#L13-L16)
+**文件**: [actualize_script.php#L13-L16](app/actualize_script.php#L13-L16)
 
 ```php
 $_GET['c'] = 'feed';
@@ -47,7 +47,7 @@ $_GET['maxFeeds'] = PHP_INT_MAX;
 
 #### 入口 2：Web 界面手动刷新
 
-**文件**: [feedController.php#L954-L1033](file:///d:/fz/0601-2/solo-dogfeeding/code/28-FreshRSS/app/Controllers/feedController.php#L954-L1033)
+**文件**: [feedController.php#L954-L1033](app/Controllers/feedController.php#L954-L1033)
 
 ```php
 public function actualizeAction(): int {
@@ -62,7 +62,7 @@ public function actualizeAction(): int {
 
 #### 入口 3：添加新 Feed 时
 
-**文件**: [feedController.php#L115](file:///d:/fz/0601-2/solo-dogfeeding/code/28-FreshRSS/app/Controllers/feedController.php#L115)
+**文件**: [feedController.php#L115](app/Controllers/feedController.php#L115)
 
 ```php
 // Ok, feed has been added in database. Now we have to refresh entries.
@@ -73,7 +73,7 @@ self::actualizeFeedsAndCommit($id, $url);
 
 #### 入口 4：WebSub（PubSubHubbub）实时推送
 
-**文件**: [p/api/pshb.php](file:///d:/fz/0601-2/solo-dogfeeding/code/28-FreshRSS/p/api/pshb.php)
+**文件**: [p/api/pshb.php](p/api/pshb.php)
 
 - 支持 WebSub 的源直接推送更新
 - 调用 `actualizeFeedsAndCommit()`，传入 `$simplePiePush`
@@ -82,7 +82,7 @@ self::actualizeFeedsAndCommit($id, $url);
 
 ### 2.2 actualizeFeeds 核心流程
 
-**文件**: [feedController.php#L427-L849](file:///d:/fz/0601-2/solo-dogfeeding/code/28-FreshRSS/app/Controllers/feedController.php#L427-L849)
+**文件**: [feedController.php#L427-L849](app/Controllers/feedController.php#L427-L849)
 
 #### Step 1：筛选需要刷新的 Feed
 
@@ -105,7 +105,7 @@ if (time() <= $feed->lastUpdate() + $ttl) {
 
 #### Step 2：加载 Feed 内容
 
-**文件**: [Feed.php#L601-L693](file:///d:/fz/0601-2/solo-dogfeeding/code/28-FreshRSS/app/Models/Feed.php#L601-L693)
+**文件**: [Feed.php#L601-L693](app/Models/Feed.php#L601-L693)
 
 ```php
 public function load(bool $loadDetails = false, bool $noCache = false): ?FreshRSS_SimplePieCustom {
@@ -133,7 +133,7 @@ public function load(bool $loadDetails = false, bool $noCache = false): ?FreshRS
 
 #### Step 3：解析并生成 Entry 对象
 
-**文件**: [Feed.php#L807-L942](file:///d:/fz/0601-2/solo-dogfeeding/code/28-FreshRSS/app/Models/Feed.php#L807-L942)
+**文件**: [Feed.php#L807-L942](app/Models/Feed.php#L807-L942)
 
 ```php
 public function loadEntries(FreshRSS_SimplePieCustom $simplePie): Traversable {
@@ -160,7 +160,7 @@ public function loadEntries(FreshRSS_SimplePieCustom $simplePie): Traversable {
 
 ### 3.1 `loadCompleteContent()` — 决策与调度中心
 
-**文件**: [Entry.php#L1063-L1145](file:///d:/fz/0601-2/solo-dogfeeding/code/28-FreshRSS/app/Models/Entry.php#L1063-L1145)
+**文件**: [Entry.php#L1063-L1145](app/Models/Entry.php#L1063-L1145)
 
 ```php
 public function loadCompleteContent(bool $force = false): bool {
@@ -221,10 +221,10 @@ public function loadCompleteContent(bool $force = false): bool {
 
 ### 3.3 `getContentByParsing()` — 实际抓取与解析
 
-**文件**: [Entry.php#L924-L1058](file:///d:/fz/0601-2/solo-dogfeeding/code/28-FreshRSS/app/Models/Entry.php#L924-L1058)
+**文件**: [Entry.php#L924-L1058](app/Models/Entry.php#L924-L1058)
 
 ```
-文章链接 → [HTTP请求+缓存] → HTML内容 → [DOM解析] → [CSS选择器提取] → [过滤] → [HTML清洗] → 纯净全文
+文章链接 → [HTTP请求(含重定向)+缓存] → HTML内容 → [DOM解析] → [CSS选择器提取] → [过滤] → [HTML清洗] → 纯净全文
 ```
 
 #### Step 1：条件检查
@@ -259,7 +259,95 @@ $response = FreshRSS_http_Util::httpGet(
 $html = $response['body'];
 ```
 
-#### Step 3：CSS 选择器提取正文
+#### Step 3：页面重定向处理（HTTP 301/302 + HTML meta refresh）
+
+这是本文档重点补充的部分。全文抓取会遇到两类重定向，代码分两层处理：
+
+##### Layer A：HTTP 协议级重定向（301/302）
+
+由 cURL 自动处理，配置在 [httpUtil.php#L336-L386](app/Utils/httpUtil.php#L336-L386)：
+
+```php
+curl_setopt_array($ch, [
+    CURLOPT_URL => $url,
+    CURLOPT_MAXREDIRS => 4,           // 最多 4 次 HTTP 重定向
+    CURLOPT_FOLLOWLOCATION => true,   // 自动跟随 301/302
+    CURLOPT_ACCEPT_ENCODING => '',    // 启用 gzip/deflate/br
+]);
+
+// 安全限制：仅允许 http/https 协议的重定向
+if (defined('CURLOPT_PROTOCOLS_STR')) {
+    $curl_options[CURLOPT_PROTOCOLS_STR] = 'http,https';
+    $curl_options[CURLOPT_REDIR_PROTOCOLS_STR] = 'http,https';
+}
+```
+
+cURL 请求完成后，获取最终落地 URL 与跳转次数：
+
+```php
+$c_effective_url  = curl_getinfo($ch, CURLINFO_EFFECTIVE_URL);   // 最终 URL
+$c_redirect_count = curl_getinfo($ch, CURLINFO_REDIRECT_COUNT);  // 实际跳转了几次
+```
+
+##### Layer B：HTML meta refresh 重定向（JS 跳转的替代方案）
+
+很多站点会在 HTML 中嵌入 `<meta http-equiv="refresh">` 进行二次跳转，cURL 无法处理。
+FreshRSS 在拿到 HTML 后，通过 DOM 扫描手动跟随。见 [Entry.php#L958-L973](app/Models/Entry.php#L958-L973)：
+
+```php
+// 先用 HTTP 重定向次数抵扣总预算
+$url = $response['effective_url'] ?: $url;
+$maxRedirs -= $response['redirect_count'];   // 总预算 4 - 已用 HTTP 重定向次数
+
+if ($maxRedirs > 0) {
+    // 扫描所有 <meta content="...">
+    $metas = $xpath->query('//meta[@content]') ?: [];
+    foreach ($metas as $meta) {
+        if ($meta instanceof DOMElement
+            && strtolower(trim($meta->getAttribute('http-equiv'))) === 'refresh') {
+
+            // 解析 content="0; url=http://..."
+            // 正则去掉前面的秒数、分号、空格，以及可选的 "url=" 前缀
+            $refresh = preg_replace('/^[0-9.; ]*\s*(url\s*=)?\s*/i', '',
+                trim($meta->getAttribute('content')));
+
+            // 相对 URL 转绝对
+            $refresh = is_string($refresh)
+                ? \SimplePie\Misc::absolutize_url($refresh, $url)
+                : false;
+
+            if ($refresh != false && $refresh !== $url) {
+                // 递归调用自身，重定向预算 -1
+                return $this->getContentByParsing($refresh, $maxRedirs - 1);
+            }
+        }
+    }
+}
+```
+
+**重定向处理的完整预算分配**：
+
+| 阶段 | 预算来源 | 最大次数 | 说明 |
+|------|----------|----------|------|
+| HTTP 301/302 | cURL CURLOPT_MAXREDIRS | 4 | 自动跟随，仅 http/https |
+| HTML meta refresh | `$maxRedirs` 参数（初值 4）减去 HTTP 已用 | 剩余 | DOM 扫描后递归 |
+
+##### 重定向后 base href 的计算
+
+无论何种重定向，最终需要确定 HTML 内相对 URL 的基准。见 [Entry.php#L975-L981](app/Models/Entry.php#L975-L981)：
+
+```php
+// 优先使用 HTML 中 <base href="...">（如果存在）
+$base = $xpath->evaluate('normalize-space(//base/@href)');
+if ($base == false || !is_string($base)) {
+    $base = $url;   // 回退到最终落地 URL（含 HTTP + meta 重定向之后）
+} elseif (str_starts_with($base, '//')) {
+    // 协议相对 URL "//www.example.net" 补全 scheme
+    $base = (parse_url($url, PHP_URL_SCHEME) ?? 'https') . ':' . $base;
+}
+```
+
+#### Step 4：CSS 选择器提取正文
 
 ```php
 $doc = new DOMDocument();
@@ -283,9 +371,9 @@ foreach ($nodes as $node) {
 }
 ```
 
-#### Step 4：SimplePie 内容清洗
+#### Step 5：SimplePie 内容清洗
 
-**文件**: [SimplePieCustom.php#L285-L310](file:///d:/fz/0601-2/solo-dogfeeding/code/28-FreshRSS/app/Models/SimplePieCustom.php#L285-L310)
+**文件**: [SimplePieCustom.php#L285-L310](app/Models/SimplePieCustom.php#L285-L310)
 
 ```php
 $html = FreshRSS_SimplePieCustom::sanitizeHTML($html, $base);
@@ -295,15 +383,15 @@ $html = FreshRSS_SimplePieCustom::sanitizeHTML($html, $base);
 
 | 清洗类别 | 配置位置 | 说明 |
 |----------|----------|------|
-| 允许的 HTML 属性 | [L68-L80](file:///d:/fz/0601-2/solo-dogfeeding/code/28-FreshRSS/app/Models/SimplePieCustom.php#L68-L80) | `dir`, `lang`, `title`, `role` 等 |
-| 允许的 HTML 元素及属性 | [L81-L226](file:///d:/fz/0601-2/solo-dogfeeding/code/28-FreshRSS/app/Models/SimplePieCustom.php#L81-L226) | 大段白名单：`a`, `img`, `video`, `table`, MathML 等 |
-| 强制剥离的属性 | [L227-L232](file:///d:/fz/0601-2/solo-dogfeeding/code/28-FreshRSS/app/Models/SimplePieCustom.php#L227-L232) | `data-original` 等不安全属性 |
-| 强制添加的属性 | [L233-L241](file:///d:/fz/0601-2/solo-dogfeeding/code/28-FreshRSS/app/Models/SimplePieCustom.php#L233-L241) | `<audio controls>`, `<iframe sandbox>` 等安全加固 |
-| URL 重写规则 | [L242-L267](file:///d:/fz/0601-2/solo-dogfeeding/code/28-FreshRSS/app/Models/SimplePieCustom.php#L242-L267) | 相对 URL 转绝对 URL |
-| HTTPS 强制域名 | [L268-L282](file:///d:/fz/0601-2/solo-dogfeeding/code/28-FreshRSS/app/Models/SimplePieCustom.php#L268-L282) | `force-https.txt` 列表中的域名强制 https |
-| 禁止的 URI Scheme | [L67](file:///d:/fz/0601-2/solo-dogfeeding/code/28-FreshRSS/app/Models/SimplePieCustom.php#L67) | `javascript:` 被禁用 |
+| 允许的 HTML 属性 | [L68-L80](app/Models/SimplePieCustom.php#L68-L80) | `dir`, `lang`, `title`, `role` 等 |
+| 允许的 HTML 元素及属性 | [L81-L226](app/Models/SimplePieCustom.php#L81-L226) | 大段白名单：`a`, `img`, `video`, `table`, MathML 等 |
+| 强制剥离的属性 | [L227-L232](app/Models/SimplePieCustom.php#L227-L232) | `data-original` 等不安全属性 |
+| 强制添加的属性 | [L233-L241](app/Models/SimplePieCustom.php#L233-L241) | `<audio controls>`, `<iframe sandbox>` 等安全加固 |
+| URL 重写规则 | [L242-L267](app/Models/SimplePieCustom.php#L242-L267) | 相对 URL 转绝对 URL |
+| HTTPS 强制域名 | [L268-L282](app/Models/SimplePieCustom.php#L268-L282) | `force-https.txt` 列表中的域名强制 https |
+| 禁止的 URI Scheme | [L67](app/Models/SimplePieCustom.php#L67) | `javascript:` 被禁用 |
 
-#### Step 5：二次过滤
+#### Step 6：二次过滤
 
 ```php
 // 【第二次过滤】sanitize 后再次过滤（因为清洗可能产生新的可匹配节点）
@@ -345,7 +433,7 @@ foreach ($filterednodes as $filterednode) {
 
 ### 4.2 HTTP 缓存逻辑
 
-**文件**: [httpUtil.php#L271-L445](file:///d:/fz/0601-2/solo-dogfeeding/code/28-FreshRSS/app/Utils/httpUtil.php#L271-L445)
+**文件**: [httpUtil.php#L271-L445](app/Utils/httpUtil.php#L271-L445)
 
 ```php
 public static function httpGet(string $url, ?string $cachePath = null, ...): array {
@@ -395,7 +483,7 @@ public static function httpGet(string $url, ?string $cachePath = null, ...): arr
 
 ### 4.3 缓存文件命名规则
 
-**文件**: [Feed.php#L1295-L1317](file:///d:/fz/0601-2/solo-dogfeeding/code/28-FreshRSS/app/Models/Feed.php#L1295-L1317)
+**文件**: [Feed.php#L1295-L1317](app/Models/Feed.php#L1295-L1317)
 
 ```php
 public function cacheFilename(string $url = ''): string {
@@ -432,7 +520,7 @@ $cachePath = $feed->cacheFilename($url . '#' . $feed->pathEntries());
 | **前置** | `prepend` | content = 全文 + 摘要 |
 | **追加** | `append` | content = 摘要 + 全文 |
 
-代码实现参考 [Entry.php#L1083-L1097](file:///d:/fz/0601-2/solo-dogfeeding/code/28-FreshRSS/app/Models/Entry.php#L1083-L1097)。
+代码实现参考 [Entry.php#L1083-L1097](app/Models/Entry.php#L1083-L1097)。
 
 ### 5.2 内容标记与恢复
 
@@ -452,7 +540,7 @@ public function originalContent(): string {
 
 ### 5.3 入数据库
 
-**文件**: [EntryDAO.php](file:///d:/fz/0601-2/solo-dogfeeding/code/28-FreshRSS/app/Models/EntryDAO.php)
+**文件**: [EntryDAO.php](app/Models/EntryDAO.php)
 
 ```php
 // 新文章
@@ -467,7 +555,7 @@ $entryDAO->commitNewEntries();
 
 ### 5.4 哈希与去重
 
-**文件**: [Entry.php#L513-L520](file:///d:/fz/0601-2/solo-dogfeeding/code/28-FreshRSS/app/Models/Entry.php#L513-L520)
+**文件**: [Entry.php#L513-L520](app/Models/Entry.php#L513-L520)
 
 ```php
 public function hash(): string {
@@ -498,11 +586,11 @@ if (isset($existingHashForGuids[$entry->guid()])) {
 
 ---
 
-## 六、展示层合并
+## 六、展示层合并与附件去重
 
 ### 6.1 视图渲染入口
 
-**文件**: [normal.phtml#L130-L132](file:///d:/fz/0601-2/solo-dogfeeding/code/28-FreshRSS/app/views/index/normal.phtml#L130-L132)
+**文件**: [normal.phtml#L130-L132](app/views/index/normal.phtml#L130-L132)
 
 ```php
 <div class="text"><?=
@@ -512,54 +600,285 @@ if (isset($existingHashForGuids[$entry->guid()])) {
 ?></div>
 ```
 
-Helper 模板中也使用同样方式：[article.phtml#L102](file:///d:/fz/0601-2/solo-dogfeeding/code/28-FreshRSS/app/views/helpers/index/article.phtml#L102)
+Helper 模板中也使用同样方式：[article.phtml#L102](app/views/helpers/index/article.phtml#L102)
 
-### 6.2 `content()` 方法 — 最终合并
+### 6.2 `content()` 方法 — 最终合并 + 附件去重
 
-**文件**: [Entry.php#L220-L313](file:///d:/fz/0601-2/solo-dogfeeding/code/28-FreshRSS/app/Models/Entry.php#L220-L313)
+**文件**: [Entry.php#L192-L313](app/Models/Entry.php#L192-L313)
+
+这是展示层的核心函数，除了合并正文外，还包含了完整的附件去重逻辑。
+
+#### 附件去重判定方法
+
+**方法 1：`containsLink()` — 检查 URL 是否已存在于 HTML 中**
+
+[Entry.php#L192-L194](app/Models/Entry.php#L192-L194)
+
+```php
+private static function containsLink(string $html, string $link): bool {
+    // 用正则匹配被引号包裹的 URL（不覆盖所有边界情况，简单字符串比较）
+    return preg_match('/(?P<delim>[\'"])' . preg_quote($link, '/') . '(?P=delim)/', $html) == 1;
+}
+```
+
+> 注：该方法仅做简单的引号内字符串匹配，不处理 unquoted 属性值、HTML 注释变体等场景，适合做"明显重复"的快速过滤。
+
+**方法 2：`enclosureIsImage()` — 判断 enclosure 是否为图片类型**
+
+[Entry.php#L197-L205](app/Models/Entry.php#L197-L205)
+
+```php
+private static function enclosureIsImage(array $enclosure): bool {
+    $elink  = $enclosure['url']    ?? '';
+    $length = $enclosure['length'] ?? 0;
+    $medium = $enclosure['medium'] ?? '';
+    $mime   = $enclosure['type']   ?? '';
+
+    return ($elink != '' && $medium === 'image')           // ① media:content medium="image"
+        || str_starts_with($mime, 'image')                  // ② MIME 以 image/ 开头
+        || ($mime == '' && $length == 0                     // ③ 兜底：无 MIME 无大小
+            && preg_match('/[.](avif|gif|jpe?g|png|svg|webp)([?#]|$)/i', $elink));  // 根据扩展名猜
+}
+```
+
+#### 完整渲染流程（含去重）
 
 ```php
 public function content(bool $withEnclosures = true, bool $allowDuplicateEnclosures = false): string {
     if (!$withEnclosures) {
-        return $this->content;  // 仅返回已合并的正文
+        return $this->content;  // 仅返回已合并的正文（不含任何附件）
     }
-    
+
     $content = $this->content;
-    
-    // ① 追加缩略图 enclosure
+
+    // ─────────────────────────────────────────────────
+    // ① 追加 thumbnail 缩略图 enclosure
+    // ─────────────────────────────────────────────────
     $thumbnailAttribute = $this->attributeArray('thumbnail') ?? [];
     if (!empty($thumbnailAttribute['url'])) {
-        $content .= '<figure class="enclosure">
-            <p class="enclosure-content">
-                <img class="enclosure-thumbnail" src="{$elink}" alt="" />
-            </p>
-        </figure>';
-    }
-    
-    // ② 追加附件 enclosures（图片、音频、视频、文件）
-    $attributeEnclosures = $this->attributeArray('enclosures');
-    foreach ($attributeEnclosures as $enclosure) {
-        $mime = $enclosure['type'] ?? '';
-        if (self::enclosureIsImage($enclosure)) {
-            $content .= '<p class="enclosure-content"><img src="'.$elink.'" /></p>';
-        } elseif (str_starts_with($mime, 'audio')) {
-            $content .= '<p class="enclosure-content"><audio controls src="'.$elink.'"></audio></p>';
-        } elseif (str_starts_with($mime, 'video')) {
-            $content .= '<p class="enclosure-content"><video controls src="'.$elink.'"></video></p>';
-        } else {
-            $content .= '<p class="enclosure-content"><a download href="'.$elink.'">💾</a></p>';
+        $elink = $thumbnailAttribute['url'];
+        // 去重：只有当正文 HTML 中不包含该 URL 时才追加
+        if (is_string($elink) && ($allowDuplicateEnclosures || !self::containsLink($content, $elink))) {
+            $content .= <<<HTML
+                <figure class="enclosure">
+                    <p class="enclosure-content">
+                        <img class="enclosure-thumbnail" src="{$elink}" alt="" />
+                    </p>
+                </figure>
+                HTML;
         }
     }
-    
+
+    // ─────────────────────────────────────────────────
+    // ② 追加 enclosures（图片 / 音频 / 视频 / 通用附件）
+    // ─────────────────────────────────────────────────
+    $attributeEnclosures = $this->attributeArray('enclosures');
+    if (empty($attributeEnclosures)) {
+        return $content;
+    }
+
+    foreach ($attributeEnclosures as $enclosure) {
+        if (!is_array($enclosure)) continue;
+        $elink = $enclosure['url'] ?? '';
+        if ($elink == '' || !is_string($elink)) continue;
+
+        // ⭐ 去重检查（与 thumbnail 使用同一判定函数）
+        if (!$allowDuplicateEnclosures && self::containsLink($content, $elink)) {
+            continue;   // 正文里已有相同 URL（例如 <img src="同一个链接">），不再重复追加
+        }
+
+        // 读取 enclosure 附加信息
+        $credits    = $enclosure['credit'] ?? '';
+        $description = is_string($enclosure['description'] ?? null)
+            ? nl2br($enclosure['description'], true)    // 换行符转 <br />
+            : '';
+        $length     = is_numeric($enclosure['length'] ?? null) ? (int)$enclosure['length'] : 0;
+        $medium     = is_string($enclosure['medium'] ?? null) ? $enclosure['medium'] : '';
+        $mime       = is_string($enclosure['type'] ?? null) ? $enclosure['type'] : '';
+        $thumbnails = is_array($enclosure['thumbnails'] ?? null) ? $enclosure['thumbnails'] : [];
+        $etitle     = is_string($enclosure['title'] ?? null) ? $enclosure['title'] : '';
+
+        $content .= "\n" . '<figure class="enclosure">';
+
+        // 2a. 先渲染 enclosure 的缩略图（media:thumbnail）
+        foreach ($thumbnails as $thumbnail) {
+            if (is_string($thumbnail)) {
+                $content .= '<p><img class="enclosure-thumbnail" src="' . $thumbnail
+                    . '" alt="" title="' . $etitle . '" /></p>';
+            }
+        }
+
+        // 2b. 根据类型渲染主 enclosure（4 类）
+        if (self::enclosureIsImage(['url' => $elink, 'length' => $length, 'medium' => $medium, 'type' => $mime])) {
+            // 图片：直接 <img> 嵌入
+            $content .= '<p class="enclosure-content"><img src="' . $elink
+                . '" alt="" title="' . $etitle . '" /></p>';
+        } elseif ($medium === 'audio' || str_starts_with($mime, 'audio')) {
+            // 音频：<audio controls> + 下载图标
+            $content .= '<p class="enclosure-content"><audio preload="none" src="' . $elink
+                . ($length === null ? '' : '" data-length="' . $length)
+                . ($mime == '' ? '' : '" data-type="' . htmlspecialchars($mime, ENT_COMPAT, 'UTF-8'))
+                . '" controls="controls" title="' . $etitle . '"></audio> <a download="" href="' . $elink . '">💾</a></p>';
+        } elseif ($medium === 'video' || str_starts_with($mime, 'video')) {
+            // 视频：<video controls> + 下载图标
+            $content .= '<p class="enclosure-content"><video preload="none" src="' . $elink
+                . ($length === null ? '' : '" data-length="' . $length)
+                . ($mime == '' ? '' : '" data-type="' . htmlspecialchars($mime, ENT_COMPAT, 'UTF-8'))
+                . '" controls="controls" title="' . $etitle . '"></video> <a download="" href="' . $elink . '">💾</a></p>';
+        } else {
+            // 其它：application/pdf、text/plain 等通用附件，仅显示下载图标
+            $content .= '<p class="enclosure-content"><a download="" href="' . $elink
+                . ($mime == '' ? '' : '" data-type="' . htmlspecialchars($mime, ENT_COMPAT, 'UTF-8'))
+                . ($medium == '' ? '' : '" data-medium="' . htmlspecialchars($medium, ENT_COMPAT, 'UTF-8'))
+                . '" title="' . $etitle . '">💾</a></p>';
+        }
+
+        // 2c. 渲染版权信息（© credit）
+        if ($credits != '') {
+            $credits = is_array($credits) ? $credits : [$credits];
+            foreach ($credits as $credit) {
+                if (is_string($credit)) {
+                    $content .= '<p class="enclosure-credits">© ' . $credit . '</p>';
+                }
+            }
+        }
+        // 2d. 渲染 enclosure description（使用 HTML5 <figcaption>）
+        if ($description != '') {
+            $content .= '<figcaption class="enclosure-description">' . $description . '</figcaption>';
+        }
+
+        $content .= '</figure>';
+    }
+
     return $content;
 }
 ```
 
-**展示层的最终内容** = `[RSS摘要 + 全文]（按策略合并） + [缩略图] + [附件 enclosures]`
+**展示层的最终内容** = `[RSS摘要 + 全文]（按策略合并） + [缩略图 enclosure（去重）] + [附件 enclosures（去重 + 按类型渲染 + description/credit）]`
+
+### 6.3 RSS 输出模板中的附件去重
+
+FreshRSS 自身也能以 RSS 格式输出内容（供其它 RSS 阅读器消费），在 [rss.phtml#L73-L78](app/views/index/rss.phtml#L73-L78) 中实现了更轻量的 URL 级去重：
+
+```php
+$urls = [];
+foreach ($enclosures as $enclosure) {
+    if (empty($enclosure['url']) || isset($urls[$enclosure['url']])) {
+        continue;   // 同一 URL 的 enclosure 只输出一个 <media:content>
+    }
+    $urls[$enclosure['url']] = true;
+    // ... 输出 <media:content ...>
+}
+```
+
+> 注意这里的差别：RSS 输出模板用的是**哈希表去重**（精确 URL 相等），而 HTML 展示层 `content()` 用的是**正则扫描正文**（URL 只要出现在正文 HTML 中就算重复）。
 
 ---
 
-## 七、完整时序图
+## 七、描述（description）渲染全链路
+
+FreshRSS 中有多种 "description" 概念，分别来自 Feed、Enclosure、页面 Context，用途完全不同。本节按数据流向梳理。
+
+### 7.1 Feed description（订阅源描述）
+
+#### 数据来源（3 条写入路径）
+
+**路径 A：RSS/Atom 源解析时自动获取**
+
+[Feed.php#L671-L672](app/Models/Feed.php#L671-L672)（仅当用户没有手动填写时覆盖）：
+```php
+if ($this->description() === '') {
+    $this->_description(html_only_entity_decode($simplePie->get_description()));
+}
+```
+
+同样逻辑在实际化时也会执行：[feedController.php#L811-L815](app/Controllers/feedController.php#L811-L815)
+```php
+if (trim($feed->description()) === '') {
+    $description = html_only_entity_decode($simplePie->get_description());
+    // ... 更新到 feedProperties
+}
+```
+
+**路径 B：从 OPML 文件导入**
+
+[ImportService.php#L148](app/Services/ImportService.php#L148)：
+```php
+$description = Minz_Helper::htmlspecialchars_utf8($feed_elt['description'] ?? '');
+```
+
+**路径 C：用户在 Web UI 中手动编辑**
+
+编辑表单位于 [update.phtml#L103](app/views/helpers/feed/update.phtml#L103)，存储于 `Feed.description` 字段。
+
+#### 存储与读取
+
+存储在 `Feed` 模型的 `$description` 私有属性：[Feed.php#L60](app/Models/Feed.php#L60)，通过 `description()` / `_description()` 读写：[Feed.php#L311-L312, L548-L549](app/Models/Feed.php#L311-L312)
+
+#### 渲染位置（3 处使用场景）
+
+| 场景 | 文件 | 渲染方式 |
+|------|------|----------|
+| 添加 Feed 预览页 | [add.phtml#L25-L32](app/views/feed/add.phtml#L25-L32) | `htmlspecialchars($desc, ENT_NOQUOTES, 'UTF-8')` 转义后纯文本展示 |
+| 页面 HTML `<meta description>` + RSS `<channel><description>` | [Context.php#L469-L511](app/Models/Context.php#L469-L511) | 单 Feed 视图（`type='f'`）时赋值给 `Context::$description`，供布局模板或 RSS 模板使用 |
+| OPML 导出 | [opml.phtml#L20](app/views/helpers/export/opml.phtml#L20) | `htmlspecialchars_decode()` 反转义后写入 `<outline description="...">` |
+
+**RSS 输出中 Feed description 的渲染** [rss.phtml#L11](app/views/index/rss.phtml#L11)：
+```xml
+<description><?= $this->description ?: _t('index.feed.rss_of', $this->rss_title) ?></description>
+```
+若 Feed 无 description，回退到翻译字符串 "RSS feed of {Feed 名}"。
+
+非 Feed 视图（全部/重要/星标/分类等）使用系统级 `meta_description` [Context.php#L472-L495](app/Models/Context.php#L472-L495)。
+
+### 7.2 Enclosure description（附件描述）
+
+#### 数据来源
+
+RSS 源 `<media:content>` 下的 `<media:description>` 由 SimplePie 解析后提供 `$enclosure->get_description()`。
+在 Feed 解析阶段写入 Entry attributes：[Feed.php#L857, L876-L877](app/Models/Feed.php#L857-L877)
+
+```php
+$description = $enclosure->get_description() ?? '';
+// ...
+if ($description != '') {
+    $attributeEnclosure['description'] = $description;
+}
+```
+
+最终存储于 `_entry.attributes['enclosures'][n]['description']`。
+
+#### 渲染方式
+
+在 Entry::content() 展示层渲染 enclosure 时一并输出 [Entry.php#L258, L306-L308](app/Models/Entry.php#L258-L308)：
+
+```php
+// 读取时先做 nl2br（换行转 <br />，XHTML 安全）
+$description = is_string($enclosure['description'] ?? null)
+    ? nl2br($enclosure['description'], true)
+    : '';
+
+// 用 HTML5 <figcaption> 语义化标签包裹
+if ($description != '') {
+    $content .= '<figcaption class="enclosure-description">' . $description . '</figcaption>';
+}
+```
+
+### 7.3 API / RSS 输出中的文章内容 description
+
+当 FreshRSS 作为被消费的 RSS 源输出文章时，在 `<item>` 级别使用 `<description>` 标签承载全文内容：[rss.phtml#L102-L104](app/views/index/rss.phtml#L102-L104)
+
+```xml
+<description><![CDATA[<?php
+echo $item->content(false);   // false = 不追加 enclosure，只输出正文（因为 enclosure 已单独以 <media:content> 输出）
+?>]]></description>
+```
+
+与 HTML 展示层 `$item->content(true)` 不同，RSS 输出使用 `content(false)` —— 因为 enclosure 已由 `<media:content>` / `<media:thumbnail>` 节点独立承载，避免内容重复。
+
+---
+
+## 八、完整时序图
 
 ```
 用户/Cron
@@ -579,6 +898,7 @@ feedController::actualizeFeeds()
   │    │
   │    ├─ Feed::load() → SimplePie 解析 RSS
   │    │     │
+  │    │     ├─ 提取 $simplePie->get_description()（仅当 Feed.description 为空时）
   │    │     └─ 比较 SimplePieHash 判断 Feed 是否变化
   │    │
   │    ├─ Feed::loadEntries() → 遍历 SimplePie items
@@ -587,7 +907,9 @@ feedController::actualizeFeeds()
   │    │          │
   │    │          ├─ 创建 FreshRSS_Entry（含 RSS 摘要 content）
   │    │          │
-  │    │          ├─ Entry::hash() → 计算内容哈希
+  │    │          ├─ 提取 enclosures → 存入 attributes.enclosures[].{url,type,medium,length,description,credit,thumbnails}
+  │    │          │
+  │    │          ├─ Entry::hash() → 计算内容哈希（含 originalContent + attributes）
   │    │          │
   │    │          └─ Entry::loadCompleteContent() ⭐
   │    │               │
@@ -611,6 +933,8 @@ feedController::actualizeFeeds()
   │    │                    │    │    ├─ 命中 → 返回缓存 status=-200
   │    │                    │    │    └─ 未命中 → cURL 请求
   │    │                    │    │         │
+  │    │                    │    │         ├─ cURL 自动跟随 HTTP 301/302（最多 4 次，仅 http/https）
+  │    │                    │    │         │
   │    │                    │    │         ├─ HTTP 200？
   │    │                    │    │         │    ├─ 否 → 检查 429/503 → 写 Retry-After
   │    │                    │    │         │    └─ 是 → 编码处理、base href 注入
@@ -618,6 +942,13 @@ feedController::actualizeFeeds()
   │    │                    │    │         └─ 写缓存文件
   │    │                    │
   │    │                    ├─ DOMDocument::loadHTML
+  │    │                    │
+  │    │                    ├─ 处理 HTML <meta http-equiv="refresh"> 重定向（递归，剩余预算 = 4 - HTTP 已用）
+  │    │                    │    ├─ 提取 content 属性中的 URL
+  │    │                    │    ├─ 相对 URL 转绝对
+  │    │                    │    └─ URL 变化则递归调用 getContentByParsing(newUrl, maxRedirs-1)
+  │    │                    │
+  │    │                    ├─ 计算 base href（<base> 标签优先，否则用最终落地 URL）
   │    │                    │
   │    │                    ├─ pathEntries CSS 选择器 → XPath 查询 → 提取节点
   │    │                    │
@@ -652,16 +983,27 @@ feedController::actualizeFeeds()
   └─ $entry->content(true)
        │
        ├─ 读取 DB 中已合并的 content
-       └─ 追加 thumbnail + enclosures（图片/音频/视频附件渲染）
+       │
+       ├─ 【thumbnail 去重】containsLink(content, thumb_url)? 是→跳过
+       │
+       └─ 遍历 enclosures
+            ├─ 【enclosure URL 去重】containsLink(content, enclosure_url)? 是→跳过
+            ├─ 读取 enclosure.description → nl2br
+            ├─ 读取 enclosure.credit → © 前缀
+            ├─ enclosureIsImage()? → <img>
+            ├─ 是 audio? → <audio controls> + 💾
+            ├─ 是 video? → <video controls> + 💾
+            └─ 其它? → 💾 下载图标
+            └─ (credit + description) → <figure> 内 <p> + <figcaption>
 ```
 
 ---
 
-## 八、关键配置项与可调参数
+## 九、关键配置项与可调参数
 
 | 配置项 | 所在文件 | 默认值 | 影响 |
 |--------|----------|--------|------|
-| `limits.timeout` | [config.default.php](file:///d:/fz/0601-2/solo-dogfeeding/code/28-FreshRSS/config.default.php) | 15s | HTTP 请求超时（Feed抓取 + 全文抓取） |
+| `limits.timeout` | [config.default.php](config.default.php) | 15s | HTTP 请求超时（Feed抓取 + 全文抓取） |
 | `limits.cache_duration` | config.default.php | 3600s | SimplePie + HTTP 缓存默认有效期 |
 | `limits.cache_duration_min/max` | config.default.php | 1800~86400s | HTTP 缓存上下限 |
 | `limits.retry_after_max` | config.default.php | - | HTTP 429/503 最大等待 |
@@ -677,7 +1019,7 @@ feedController::actualizeFeeds()
 
 ---
 
-## 九、特殊场景与边界条件
+## 十、特殊场景与边界条件
 
 ### 场景 1：RSS 内容本身就是全文
 - `pathEntries` 留空即可，跳过全文抓取
@@ -700,14 +1042,24 @@ feedController::actualizeFeeds()
 - 写入 `DATA_PATH/Retry-After/{domain}.txt`，mtime=重试时间戳
 - 后续请求直接跳过，直到 mtime < 当前时间
 
+### 场景 6：文章页面存在 HTML meta refresh 跳转
+- HTTP 301/302 由 cURL 自动跟随（最多 4 次，限 http/https）
+- `<meta http-equiv="refresh">` 由 Entry.php 递归解析（剩余预算 = 4 - HTTP 已用）
+- base href 以重定向后最终 URL 为准
+
+### 场景 7：RSS 正文中已嵌有 enclosure 的图片
+- `containsLink()` 正则扫描正文 HTML 中是否已有相同 URL
+- 已有则 enclosure 不重复追加，避免图片重复显示
+- RSS 输出模板使用哈希表对 enclosure URL 去重
+
 ---
 
-## 十、手动重抓与调试
+## 十一、手动重抓与调试
 
 ### 控制器动作
 
 **重新加载（清除 lastUpdate）**：
-[feedController.php#L1208-L1264](file:///d:/fz/0601-2/solo-dogfeeding/code/28-FreshRSS/app/Controllers/feedController.php#L1208-L1264)
+[feedController.php#L1208-L1264](app/Controllers/feedController.php#L1208-L1264)
 ```php
 public function reloadAction(): void {
     $feedDAO->updateFeed($feed->id(), ['lastUpdate' => 0]);
@@ -722,7 +1074,7 @@ public function reloadAction(): void {
 ```
 
 **选择器预览**：
-[feedController.php#L1274-L1338](file:///d:/fz/0601-2/solo-dogfeeding/code/28-FreshRSS/app/Controllers/feedController.php#L1274-L1338)
+[feedController.php#L1274-L1338](app/Controllers/feedController.php#L1274-L1338)
 ```php
 public function contentSelectorPreviewAction(): void {
     // 传入 feed_id + CSS selector，实时测试提取效果
@@ -733,7 +1085,7 @@ public function contentSelectorPreviewAction(): void {
 ```
 
 **清除 Feed 缓存**：
-[Feed.php#L1327-L1330](file:///d:/fz/0601-2/solo-dogfeeding/code/28-FreshRSS/app/Models/Feed.php#L1327-L1330)
+[Feed.php#L1327-L1330](app/Models/Feed.php#L1327-L1330)
 ```php
 public function clearCache(): bool {
     $this->faviconRebuild();
