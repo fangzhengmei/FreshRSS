@@ -224,9 +224,9 @@ FreshRSS 中有三种容易被混淆的缓存操作，它们作用于不同层�
 | **订阅源缓存跳过** `Feed::load($details, $noCache=true)` | Layer 1 SimplePie | `$noCache=true` 时即使 SimplePieHash 未变也返回 SimplePie 对象，但**不删除 `.spc` 缓存文件** | [Feed.php#L684](app/Models/Feed.php#L684) |
 | **`clear_cache` 属性** `Feed::load()` 中检查 | Layer 1 SimplePie | 调用 `$this->clearCache()` **删除 `.spc` 文件** + 重建 favicon，但**不删除全文 HTML 缓存** | [Feed.php#L626-L628](app/Models/Feed.php#L626-L628) |
 
-> ⚠️ **关键校正**：`clearCache()` [Feed.php#L1327-L1330](app/Models/Feed.php#L1327-L1330) **仅删除 Feed 级的 SimplePie 缓存文件（`.spc`）**，**不删除全文抓取的 HTML 缓存文件（`.html`）**。
+> ⚠️ **关键校正**：`clearCache()` [Feed.php#L1327-L1330](app/Models/Feed.php#L1327-L1330) **仅删除 Feed 级缓存文件**，**不删除全文抓取的 HTML 缓存文件（`.html`）**。
 >
-> 原因：`clearCache()` 调用 `@unlink($this->cacheFilename())`，而 `cacheFilename()` 无参数时返回 `.spc` 路径 [Feed.php#L1301-L1315](app/Models/Feed.php#L1301-L1315)。全文 HTML 缓存使用 `cacheFilename($url . '#' . $pathEntries)` 生成不同的 `.html` 文件名 [Entry.php#L950](app/Models/Entry.php#L950)，两者文件名不同，互不影响。
+> 原因：`clearCache()` 调用 `@unlink($this->cacheFilename())`，而 `cacheFilename()` **无参数**时根据 Feed 类型返回不同扩展名的文件（`.spc` / `.html` / `.json` / `.xml`）[Feed.php#L1301-L1316](app/Models/Feed.php#L1301-L1316)。全文 HTML 缓存使用 `cacheFilename($url . '#' . $pathEntries)` 生成 `.html` 文件 [Entry.php#L950](app/Models/Entry.php#L950)，两者的 URL 参数不同（一个带 `#pathEntries`，一个不带），所以文件名不同，互不影响。
 
 #### `clearCache()` 的实际行为
 
@@ -234,22 +234,34 @@ FreshRSS 中有三种容易被混淆的缓存操作，它们作用于不同层�
 // Feed.php#L1327-L1330
 public function clearCache(): bool {
     $this->faviconRebuild();              // 重建 favicon
-    return @unlink($this->cacheFilename()); // 仅删除 .spc 文件
+    return @unlink($this->cacheFilename()); // 仅删除 Feed 级缓存文件
 }
 
-// cacheFilename() 无参数时：返回 .spc（RSS 类型）
-// cacheFilename($url) 有参数时：返回 .html（全文抓取用）
+// cacheFilename() 无参数时：根据 Feed kind 返回不同扩展名
+// cacheFilename($url) 有参数时：始终返回 .html（全文抓取用）
 public function cacheFilename(string $url = ''): string {
+    $simplePie = new FreshRSS_SimplePieCustom(...);
     if ($url !== '') {
-        return CACHE_PATH . '/' . $filename . '.html';  // 全文 HTML 缓存
+        $filename = $simplePie->get_cache_filename($url);  // URL 含 #pathEntries
+        return CACHE_PATH . '/' . $filename . '.html';      // 全文 HTML 缓存
     }
-    // 按 Feed 类型返回 .spc / .html / .json
+    $url = htmlspecialchars_decode($this->url);              // Feed 原始 URL
+    $filename = $simplePie->get_cache_filename($url);
     switch ($this->kind) {
-        case KIND_RSS: return CACHE_PATH . '/' . $filename . '.spc';
-        // ...
+        case KIND_HTML_XPATH:  return CACHE_PATH . '/' . $filename . '.html';
+        case KIND_XML_XPATH:   return CACHE_PATH . '/' . $filename . '.xml';
+        case KIND_JSON_*:      return CACHE_PATH . '/' . $filename . '.json';
+        case KIND_RSS:
+        default:               return CACHE_PATH . '/' . $filename . '.spc';
     }
 }
 ```
+
+> **核心区别**：Feed 级缓存和全文 HTML 缓存使用**不同的 URL** 作为 `get_cache_filename()` 的输入：
+> - Feed 级：`$this->url`（Feed 订阅地址）
+> - 全文 HTML：`$url . '#' . $pathEntries`（文章 URL + CSS 选择器哈希）
+>
+> 即使 Feed 类型是 `KIND_HTML_XPATH`（返回 `.html`），两者的文件名因 URL 不同而不会冲突。`clearCache()` 只删除 Feed 级缓存，全文 HTML 缓存不受影响。
 
 #### 全文 HTML 缓存（`.html`）的清理方式
 
@@ -480,10 +492,50 @@ if ($maxRedirs > 0) {
 
 **重定向处理的完整预算分配**：
 
-| 阶段 | 预算来源 | 最大次数 | 说明 |
-|------|----------|----------|------|
-| HTTP 301/302 | cURL CURLOPT_MAXREDIRS（默认 4） | 4 | 自动跟随，仅 http/https，次数计入总预算 |
-| HTML meta refresh | `$maxRedirs` 参数（初值 4）减去 HTTP 已用 | 剩余 | DOM 扫描后递归，每次递归预算 -1 |
+> ⚠️ **重大校正**：`$maxRedirs` 与 `CURLOPT_MAXREDIRS` 是**两套独立的限制**，之前的"总跳转次数 ≤ 4"描述有误。
+
+| 限制机制 | 作用范围 | 默认值 | 代码位置 | 可否覆盖 |
+|----------|----------|--------|----------|----------|
+| `CURLOPT_MAXREDIRS` | **单次** `httpGet()` 的 HTTP 301/302 跳转 | 4 | [httpUtil.php#L346](app/Utils/httpUtil.php#L346) | ✅ `curl_options` / `curl_params` 覆盖 |
+| `$maxRedirs` 参数 | 跨递归层的**总预算**，同时抵扣 HTTP + 控制 meta 递归 | 4 | [Entry.php#L924](app/Models/Entry.php#L924) | ❌ 调用方固定传 4 |
+
+**关键洞察 — 两套限制的独立性**：
+
+```php
+// httpUtil.php#L346 - 每次调用 httpGet() 都重新设置
+CURLOPT_MAXREDIRS => 4,   // 硬编码，但可被 curl_options 覆盖
+
+// Entry.php#L960-L961 - $maxRedirs 是跨递归层的总预算
+$maxRedirs -= $response['redirect_count'];  // HTTP 抵扣
+if ($maxRedirs > 0) {                        // 仅控制 meta 递归条件
+    return $this->getContentByParsing($refresh, $maxRedirs - 1);  // meta 递归 -1
+}
+```
+
+递归调用 `getContentByParsing($refresh, $maxRedirs - 1)` 时，内部**再次调用** `httpGet()`，`CURLOPT_MAXREDIRS` **重新设为 4**。因此每层递归都有独立的 4 次 HTTP 重定向预算，`$maxRedirs` 只控制 meta refresh 递归的条件（`> 0`）。
+
+**实际最大总跳转次数可达 8 次**（非 4 次）：
+
+```
+最极端场景：
+  第1层: 0次HTTP重定向 → $maxRedirs = 4-0 = 4 > 0 → meta递归(传入3)
+  第2层: 0次HTTP重定向 → $maxRedirs = 3-0 = 3 > 0 → meta递归(传入2)
+  第3层: 0次HTTP重定向 → $maxRedirs = 2-0 = 2 > 0 → meta递归(传入1)
+  第4层: 0次HTTP重定向 → $maxRedirs = 1-0 = 1 > 0 → meta递归(传入0)
+  第5层: 4次HTTP重定向 → $maxRedirs = 0-4 = -4 ≤ 0 → 不再递归
+  ─────────────────────────────────────────────────────────
+  总跳转 = 4(meta) + 4(HTTP) = 8次
+```
+
+> 注：第 5 层的 4 次 HTTP 重定向不受 `$maxRedirs` 限制，只受 `CURLOPT_MAXREDIRS = 4` 限制。`$maxRedirs` 抵扣后变为负数，仅阻止后续 meta 递归，不阻止已发生的 HTTP 重定向。
+
+**缓存命中时的特殊处理**：
+
+[httpUtil.php#L281](app/Utils/httpUtil.php#L281) 命中文件缓存时返回 `redirect_count = 0`：
+```php
+return ['body' => $body, 'effective_url' => $url, 'redirect_count' => 0, ...];
+```
+此时 `$maxRedirs` 不被抵扣（`$maxRedirs -= 0`），meta refresh 有完整的初始预算。
 
 ##### 重定向后 base href 的计算
 
@@ -1039,6 +1091,46 @@ $content .= '...<video preload="none" src="' . $elink
     . ...
 ```
 
+##### `is_numeric()` 宽松性对 `$length` 取值的影响
+
+`is_numeric()` [Entry.php#L259](app/Models/Entry.php#L259) 是**宽松判断**，接受多种格式的数字字符串：
+
+| 输入值 | `is_numeric()` | `(int)` 转换 | `$length` 最终值 |
+|--------|---------------|-------------|-----------------|
+| `1234567` (int) | ✅ true | 1234567 | `1234567` |
+| `"1234567"` (string) | ✅ true | 1234567 | `1234567` |
+| `"1e5"` (科学计数法) | ✅ true | 1 | `1`（⚠️ `(int)"1e5" = 1`，非 100000） |
+| `"0"` | ✅ true | 0 | `0` |
+| `null` | ❌ false | — | `0` |
+| `""` | ❌ false | — | `0` |
+| `"unknown"` | ❌ false | — | `0` |
+
+> ⚠️ 注意 `"1e5"` 这类科学计数法字符串：`is_numeric()` 返回 true，但 `(int)"1e5"` 在 PHP 中结果为 `1`（而非 100000），导致 `data-length` 输出错误值。
+
+##### `==` 宽松比较 vs `===` 严格比较在 length 处理中的差异
+
+FreshRSS 在不同位置对 `$length` 使用了不同的比较运算符，行为有细微差异：
+
+| 位置 | 比较方式 | 代码 | 影响 |
+|------|----------|------|------|
+| `content()` data-length 输出 | `=== null`（严格） | [Entry.php#L914](app/Models/Entry.php#L914) | `$length` 已是 int，永远不为 null → **始终输出** data-length |
+| `enclosureIsImage()` 图片判定 | `== 0`（宽松） | [Entry.php#L204](app/Models/Entry.php#L204) | `$length` 为 int 时 `== 0` 与 `=== 0` 效果相同 |
+| `containsLink()` 去重 | `== 1`（宽松） | [Entry.php#L193](app/Models/Entry.php#L193) | `preg_match` 返回 int 0/1/false，`== 1` 兼容 false |
+
+```php
+// enclosureIsImage() Entry.php#L199 - 注意：这里没有 (int) 转换！
+$length = $enclosure['length'] ?? 0;   // 原始值，可能是 string/int/null
+// ...
+($mime == '' && $length == 0           // 宽松比较 ==
+    && preg_match('/[.](avif|gif|jpe?g|png|svg|webp)([?#]|$)/i', $elink))
+
+// 但 content() Entry.php#L277 传入 enclosureIsImage() 时用的是已转换的 $length
+if (self::enclosureIsImage(['url' => $elink, 'length' => $length, ...]))
+//                                              ↑ 这是 content() 中 (int) 转换后的 $length
+```
+
+> **关键**：`enclosureIsImage()` 的函数签名 [Entry.php#L196](app/Models/Entry.php#L196) 标注 `length?:int`，但内部 `$enclosure['length'] ?? 0` **不做类型转换**。实际调用时 `content()` 传入的是已 `(int)` 转换的值 [Entry.php#L277](app/Models/Entry.php#L277)，所以 `$length == 0` 在此场景等价于 `=== 0`。但如果直接调用 `enclosureIsImage()` 传入原始字符串值（如 `"0"`），宽松比较 `"0" == 0` 仍为 true。
+
 **校正后的输出规则**：
 
 | 附件类型 | data-length 输出？ | length=0 时 | 代码位置 |
@@ -1252,7 +1344,7 @@ feedController::actualizeFeeds()
   │    │                    │    │    ├─ 命中 → 返回缓存 status=-200
   │    │                    │    │    └─ 未命中 → cURL 请求
   │    │                    │    │         │
-  │    │                    │    │         ├─ cURL 自动跟随 HTTP 301/302（最多 4 次，仅 http/https）
+  │    │                    │    │         ├─ cURL 自动跟随 HTTP 301/302（CURLOPT_MAXREDIRS=4，每次 httpGet 独立）
   │    │                    │    │         │
   │    │                    │    │         ├─ HTTP 200？
   │    │                    │    │         │    ├─ 否 → 检查 429/503 → 写 Retry-After
@@ -1262,10 +1354,11 @@ feedController::actualizeFeeds()
   │    │                    │
   │    │                    ├─ DOMDocument::loadHTML
   │    │                    │
-  │    │                    ├─ 处理 HTML <meta http-equiv="refresh"> 重定向（递归，剩余预算 = 4 - HTTP 已用）
+  │    │                    ├─ 处理 HTML <meta http-equiv="refresh"> 重定向（递归，总预算 $maxRedirs=4，抵扣 HTTP 已用）
   │    │                    │    ├─ 提取 content 属性中的 URL
   │    │                    │    ├─ 相对 URL 转绝对
   │    │                    │    └─ URL 变化则递归调用 getContentByParsing(newUrl, maxRedirs-1)
+  │    │                    │    └─ 递归后 httpGet 重置 CURLOPT_MAXREDIRS=4（最大总跳转可达 8 次）
   │    │                    │
   │    │                    ├─ 计算 base href（<base> 标签优先，否则用最终落地 URL）
   │    │                    │
@@ -1330,7 +1423,7 @@ feedController::actualizeFeeds()
 | `ttl_default` | 用户配置 | - | Feed 默认刷新周期 |
 | `pubsubhubbub_enabled` | 系统配置 | true | 是否启用 WebSub 实时推送 |
 | `curl_options` | 系统配置 | [] | 全局代理、SSL 配置等 |
-| `CURLOPT_MAXREDIRS` | Feed curl_params | 4 | HTTP 301/302 最大重定向次数，OPML 支持 `frss:CURLOPT_MAXREDIRS` |
+| `CURLOPT_MAXREDIRS` | httpUtil.php 硬编码 | 4 | 单次 `httpGet()` 的 HTTP 301/302 最大重定向次数；可被 Feed `curl_params` 覆盖；与 `$maxRedirs` 独立，递归后每次 `httpGet` 重置 |
 | `content_action` | Feed attributes | `replace` | 全文合并策略 |
 | `pathEntries` | Feed 属性 | `''` | **全文抓取开关 + CSS 选择器** |
 | `path_entries_filter` | Feed attributes | `''` | 需要移除的节点 CSS 选择器 |
@@ -1365,10 +1458,12 @@ feedController::actualizeFeeds()
 - 后续请求直接跳过，直到 mtime < 当前时间
 
 ### 场景 6：文章页面存在 HTML meta refresh 跳转
-- HTTP 301/302 由 cURL 自动跟随（最多 4 次，限 http/https）
-- `<meta http-equiv="refresh">` 由 Entry.php 递归解析（剩余预算 = 4 - HTTP 已用）
+- HTTP 301/302 由 cURL 自动跟随（每次 `httpGet()` 最多 4 次，限 http/https）
+- `<meta http-equiv="refresh">` 由 Entry.php 递归解析（总预算 `$maxRedirs` 初值 4，每次 meta 递归 -1）
+- `CURLOPT_MAXREDIRS` 与 `$maxRedirs` 是**两套独立限制**，递归后每次 `httpGet()` 重置 `CURLOPT_MAXREDIRS = 4`
+- 实际最大总跳转可达 **8 次**（4 次 meta refresh + 最后一层 4 次 HTTP 301/302）
 - base href 以重定向后最终 URL 为准
-- 命中 HTTP 文件缓存时 redirect_count=0，meta refresh 有完整 4 次预算
+- 命中 HTTP 文件缓存时 redirect_count=0，$maxRedirs 不被抵扣
 
 ### 场景 7：RSS 正文中已嵌有 enclosure 的图片
 - `containsLink()` 正则扫描正文 HTML 中是否已有相同 URL
@@ -1387,17 +1482,20 @@ feedController::actualizeFeeds()
 - 双重保险机制：优先读 attributes.original_content，失败则正则移除 FULLCONTENT 注释
 
 ### 场景 10：HTTP 重定向次数用尽但仍有 meta refresh
-- 若 cURL 已用完 4 次 301/302 跳转，`$maxRedirs` 变为 0
-- 即使页面有 `<meta refresh>`，也会停止递归防止死循环
-- 总跳转次数 = HTTP 重定向次数 + HTML meta refresh 次数 ≤ 4
+- `$maxRedirs` 被 HTTP `redirect_count` 抵扣后若 ≤ 0，不再做 meta refresh 递归
+- 但单次 `httpGet()` 的 HTTP 重定向次数受 `CURLOPT_MAXREDIRS = 4` 独立控制，不受 `$maxRedirs` 限制
+- `$maxRedirs` 抵扣为负数后仅阻止后续 meta 递归，不阻止已发生的 HTTP 重定向
+- 递归后每层 `httpGet()` 重新获得独立的 4 次 HTTP 重定向预算
 
 ### 场景 11：三种"重抓"机制的区别（易混淆）
 | 操作 | 作用范围 | 删除的缓存 | 不删除的缓存 |
 |------|----------|-----------|-------------|
 | `loadCompleteContent(true)` | 单篇文章 | 无（仅跳过 DB 查询） | `.html` / `.spc` / Retry-After |
 | `Feed::load(false, true)` | 整个 Feed | 无（仅跳过 hash 比较） | `.html` / `.spc` / Retry-After |
-| `$feed->clearCache()` | Feed 级 | `.spc` + favicon | `.html` 全文缓存 / Retry-After |
-| `cleanCache(720h)` | 全局所有缓存 | 所有过期文件 | 未过期文件 |
+| `$feed->clearCache()` | Feed 级 | Feed 级缓存（按 kind: `.spc`/`.html`/`.json`/`.xml`）+ favicon | 全文 HTML 缓存 / Retry-After |
+| `cleanCache(720h)` | 全局所有缓存 | 所有过期文件（30 天+） | 未过期文件 |
+
+> **关键**：`clearCache()` 删除的是 `cacheFilename()` **无参数**时的 Feed 级文件。全文 HTML 缓存使用 `cacheFilename($url . '#' . $pathEntries)` 生成不同文件名，不受影响。
 
 ---
 
