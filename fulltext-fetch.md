@@ -212,7 +212,67 @@ public function loadCompleteContent(bool $force = false): bool {
 
 ### 3.1.1 强制重抓（`$force=true`）与多层缓存的交互
 
-`loadCompleteContent(bool $force = false)` 中的 `$force` 参数是强制重抓的总开关，但它与各层缓存的交互非常精细：
+`loadCompleteContent(bool $force = false)` 中的 `$force` 参数是单篇强制重抓的开关，但它**仅穿透 DB 层**，与其它缓存层的关系需要明确区分。
+
+#### 三种"缓存跳过/清理"机制的差异
+
+FreshRSS 中有三种容易被混淆的缓存操作，它们作用于不同层级，效果完全不同：
+
+| 机制 | 作用层级 | 实际效果 | 代码位置 |
+|------|----------|----------|----------|
+| **单篇强制重抓** `loadCompleteContent(true)` | Layer 4 DB | 跳过 `searchByGuid()` DB 查询，但 HTTP 文件缓存、Retry-After 仍生效 | [Entry.php#L1072](app/Models/Entry.php#L1072) |
+| **订阅源缓存跳过** `Feed::load($details, $noCache=true)` | Layer 1 SimplePie | `$noCache=true` 时即使 SimplePieHash 未变也返回 SimplePie 对象，但**不删除 `.spc` 缓存文件** | [Feed.php#L684](app/Models/Feed.php#L684) |
+| **`clear_cache` 属性** `Feed::load()` 中检查 | Layer 1 SimplePie | 调用 `$this->clearCache()` **删除 `.spc` 文件** + 重建 favicon，但**不删除全文 HTML 缓存** | [Feed.php#L626-L628](app/Models/Feed.php#L626-L628) |
+
+> ⚠️ **关键校正**：`clearCache()` [Feed.php#L1327-L1330](app/Models/Feed.php#L1327-L1330) **仅删除 Feed 级的 SimplePie 缓存文件（`.spc`）**，**不删除全文抓取的 HTML 缓存文件（`.html`）**。
+>
+> 原因：`clearCache()` 调用 `@unlink($this->cacheFilename())`，而 `cacheFilename()` 无参数时返回 `.spc` 路径 [Feed.php#L1301-L1315](app/Models/Feed.php#L1301-L1315)。全文 HTML 缓存使用 `cacheFilename($url . '#' . $pathEntries)` 生成不同的 `.html` 文件名 [Entry.php#L950](app/Models/Entry.php#L950)，两者文件名不同，互不影响。
+
+#### `clearCache()` 的实际行为
+
+```php
+// Feed.php#L1327-L1330
+public function clearCache(): bool {
+    $this->faviconRebuild();              // 重建 favicon
+    return @unlink($this->cacheFilename()); // 仅删除 .spc 文件
+}
+
+// cacheFilename() 无参数时：返回 .spc（RSS 类型）
+// cacheFilename($url) 有参数时：返回 .html（全文抓取用）
+public function cacheFilename(string $url = ''): string {
+    if ($url !== '') {
+        return CACHE_PATH . '/' . $filename . '.html';  // 全文 HTML 缓存
+    }
+    // 按 Feed 类型返回 .spc / .html / .json
+    switch ($this->kind) {
+        case KIND_RSS: return CACHE_PATH . '/' . $filename . '.spc';
+        // ...
+    }
+}
+```
+
+#### 全文 HTML 缓存（`.html`）的清理方式
+
+全文抓取产生的 `.html` 缓存文件**没有单独的删除方法**，只能通过以下方式清理：
+
+| 方式 | 触发条件 | 代码位置 |
+|------|----------|----------|
+| 全局过期清理 | `cleanCache(CLEANCACHE_HOURS)` 随机触发（1/31 概率），默认清理 720 小时（30 天）以上的文件 | [lib_rss.php#L294-L306](lib/lib_rss.php#L294-L306) |
+| 自然过期 | `httpGet()` 中 `cacheMtime > time() - cache_duration` 检查失败时重新请求 | [httpUtil.php#L275-L283](app/Utils/httpUtil.php#L275-L283) |
+
+```php
+// lib_rss.php#L294-L306 - 全局缓存清理
+function cleanCache(int $hours = 720): void {
+    $files = glob(CACHE_PATH . '/*.*', GLOB_NOSORT) ?: [];
+    foreach ($files as $file) {
+        if (str_ends_with($file, 'index.html')) continue;
+        $cacheMtime = @filemtime($file);
+        if ($cacheMtime !== false && $cacheMtime < time() - (3600 * $hours)) {
+            unlink($file);  // 删除所有过期的 .spc / .html / .json 文件
+        }
+    }
+}
+```
 
 #### `$force=true` 的触发场景（3 处调用）
 
@@ -225,42 +285,32 @@ public function loadCompleteContent(bool $force = false): bool {
 #### 四层缓存对 `$force` 的不同响应
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                   $force=true 对缓存的穿透能力                   │
-├──────────────┬──────────────────────────────┬────────────────────┤
-│ 缓存层级     │ $force=true 时是否穿透       │ 代码位置           │
-├──────────────┼──────────────────────────────┼────────────────────┤
-│ Layer 4 DB   │ ✅ 完全穿透（不复用DB内容）  │ Entry.php#L1072    │
-│              │  $force ? null : searchByGuid()                    │
-├──────────────┼──────────────────────────────┼────────────────────┤
-│ Layer 3      │ ❌ 不穿透（仍检查限流）      │ httpUtil.php#L307  │
-│ Retry-After  │  getRetryAfter() 检查生效                        │
-├──────────────┼──────────────────────────────┼────────────────────┤
-│ Layer 2      │ ❌ 不穿透（仍读文件缓存）    │ httpUtil.php#L275  │
-│ HTTP HTML    │  cacheMtime 检查依然生效                          │
-├──────────────┼──────────────────────────────┼────────────────────┤
-│ Layer 1      │ ⚠️  部分穿透（Feed 级）      │ Feed.php#L684      │
-│ SimplePie    │  $noCache || SimplePieHash 变化则返回非 null       │
-└──────────────┴──────────────────────────────┴────────────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│                    $force=true 对缓存的穿透能力                       │
+├──────────────┬──────────────────────────────┬─────────────────────────┤
+│ 缓存层级     │ $force=true 时是否穿透       │ 代码位置                 │
+├──────────────┼──────────────────────────────┼─────────────────────────┤
+│ Layer 4 DB   │ ✅ 完全穿透（不复用DB内容）  │ Entry.php#L1072         │
+│              │  $force ? null : searchByGuid()                        │
+├──────────────┼──────────────────────────────┼─────────────────────────┤
+│ Layer 3      │ ❌ 不穿透（仍检查限流）      │ httpUtil.php#L307       │
+│ Retry-After  │  getRetryAfter() 检查生效                              │
+├──────────────┼──────────────────────────────┼─────────────────────────┤
+│ Layer 2      │ ❌ 不穿透（仍读文件缓存）    │ httpUtil.php#L275       │
+│ HTTP HTML    │  cacheMtime 检查依然生效                               │
+│ (.html)      │  ⚠️ clearCache() 不删除此文件                           │
+├──────────────┼──────────────────────────────┼─────────────────────────┤
+│ Layer 1      │ ⚠️  部分穿透（Feed 级）      │ Feed.php#L684           │
+│ SimplePie    │  $noCache || SimplePieHash 变化则返回非 null             │
+│ (.spc)       │  clear_cache 属性可删除 .spc 文件                       │
+└──────────────┴──────────────────────────────┴─────────────────────────┘
 ```
 
 **关键洞察**：
-- `$force=true` **仅跳过 Layer 4 数据库内容复用**，HTTP 文件缓存（Layer 2）和 Retry-After 限流（Layer 3）依然生效
-- 若要真正重新抓取网页，需同时调用 `$feed->clearCache()` 删除 `.spc` 和 `.html` 文件，或等待 `limits.cache_duration` 过期
+- `$force=true` **仅跳过 Layer 4 数据库内容复用**，HTTP 文件缓存（Layer 2 `.html`）和 Retry-After 限流（Layer 3）依然生效
+- `clearCache()` **仅删除 Layer 1 的 `.spc` 文件**，**不删除** Layer 2 的 `.html` 全文缓存文件
 - Feed 级 `$noCache` [Feed.php#L601, L684](app/Models/Feed.php#L601-L684) 仅影响 SimplePieHash 比较逻辑，不删除 SimplePie 的 `.spc` 缓存文件（避免多用户场景下缓存失效）
-
-#### 真正清除所有缓存的方式
-
-```php
-// 1. 清除 SimplePie + HTTP 缓存文件（Feed 级）
-$feed->clearCache();   // Feed.php#L1327-L1330
-
-// 2. 清除 Feed 级的 SimplePieHash，强制 Feed::load 返回非 null
-$feed->_attribute('SimplePieHash', '');
-
-// 3. 强制 DB 级的全文重抓（单篇文章级）
-$entry->loadCompleteContent(true);   // 跳过 searchByGuid 复用
-```
+- 要强制重新抓取全文 HTML，只能等待 `limits.cache_duration` 过期（默认 3600s），或由全局 `cleanCache(720h)` 清理
 
 ### 3.2 触发全文抓取的**必要条件**
 
@@ -953,7 +1003,7 @@ public function content(bool $withEnclosures = true, bool $allowDuplicateEnclosu
 
 #### 展示层 `length` 信息输出（`data-length` 属性）
 
-`enclosure['length']` 来自 RSS `<media:content length="...">`，在 FreshRSS 中有完整的读写闭环：
+`enclosure['length']` 来自 RSS `<media:content length="...">`，在 FreshRSS 中有完整的读写闭环。
 
 ##### 数据流向
 
@@ -962,27 +1012,43 @@ SimplePie 解析 <media:content length="1234567">
     ↓ 存入
 _entry.attributes.enclosures[n].length = 1234567
     ↓ 读取（Entry::content()）
-$length = (int)$enclosure['length']  →  1234567
-    ↓ 输出到 HTML
-<audio data-length="1234567" ...> 或 <video data-length="1234567" ...>
+$length = is_numeric(...) ? (int)$enclosure['length'] : 0  →  1234567（或 0）
+    ↓ 输出到 HTML（仅 audio/video）
+<audio data-length="1234567" ...> 或 <video data-length="0" ...>
     ↓ 反向解析（Entry::enclosures()）
 $enclosure['length'] = (int)$element->getAttribute('data-length')
 ```
 
-##### 输出规则（仅音频/视频有 length 输出）
+##### ⚠️ 输出条件校正：`data-length` 始终输出（`=== null` 为死代码）
 
-| 附件类型 | data-length 输出？ | 代码位置 |
-|----------|-------------------|----------|
-| 图片（image） | ❌ 无 | [Entry.php#L727-L728](app/Models/Entry.php#L727-L728) |
-| 音频（audio） | ✅ 有 | [Entry.php#L732-L734](app/Models/Entry.php#L732-L734) |
-| 视频（video） | ✅ 有 | [Entry.php#L737-L739](app/Models/Entry.php#L737-L739) |
-| 通用附件（其它） | ❌ 无 | [Entry.php#L741-L745](app/Models/Entry.php#L741-L745) |
+**关键发现**：`$length` 在赋值时已被强制转换为 `int`，永远不会是 `null`，因此 `=== null` 判断是**不可达的死代码**，`data-length` 对 audio/video **始终输出**（即使 length=0）。
 
-**条件判断代码**：
 ```php
-// $length 为 null 时不输出该属性（兼容旧数据）
-($length === null ? '' : '" data-length="' . $length)
+// Entry.php#L259 - $length 被强制转为 int
+$length = is_numeric($enclosure['length'] ?? null) ? (int)$enclosure['length'] : 0;
+//         ↑ 非数字时为 0，数字时为 (int)，结果永远是 int，永远不是 null
+
+// Entry.php#L914 - 音频渲染（$length === null 永远为 false，data-length 始终输出）
+$content .= '...<audio preload="none" src="' . $elink
+    . ($length === null ? '' : '" data-length="' . $length)   // ← 死代码分支
+    . ...
+
+// Entry.php#L920 - 视频渲染（同上）
+$content .= '...<video preload="none" src="' . $elink
+    . ($length === null ? '' : '" data-length="' . $length)   // ← 死代码分支
+    . ...
 ```
+
+**校正后的输出规则**：
+
+| 附件类型 | data-length 输出？ | length=0 时 | 代码位置 |
+|----------|-------------------|-------------|----------|
+| 图片（image） | ❌ 无 | 不适用 | [Entry.php#L907-L910](app/Models/Entry.php#L907-L910) |
+| 音频（audio） | ✅ **始终输出** | 输出 `data-length="0"` | [Entry.php#L912-L916](app/Models/Entry.php#L912-L916) |
+| 视频（video） | ✅ **始终输出** | 输出 `data-length="0"` | [Entry.php#L918-L922](app/Models/Entry.php#L918-L922) |
+| 通用附件（其它） | ❌ 无 | 不适用 | [Entry.php#L924-L928](app/Models/Entry.php#L924-L928) |
+
+> **对比通用附件**：通用附件（else 分支）不输出 `data-length`，但输出 `data-type` 和 `data-medium`，条件同样使用 `$mime == ''` 和 `$medium == ''` 判断（空字符串检查，非 null 检查）。
 
 > **用途**：`data-length` 是 HTML5 自定义数据属性，供前端 JavaScript 读取（如显示文件大小、计算播放进度条百分比等）。FreshRSS 自身不使用该值，仅作为元数据透传给前端。
 
@@ -1312,7 +1378,8 @@ feedController::actualizeFeeds()
 ### 场景 8：强制重抓 `$force=true` 但 HTTP 缓存仍生效
 - `loadCompleteContent(true)` 仅跳过 Layer 4 DB 内容复用
 - Layer 2 HTTP 文件缓存（`.html`）和 Layer 3 Retry-After 仍检查
-- 需同时调用 `$feed->clearCache()` 才能真正重新请求网页
+- ⚠️ `clearCache()` **仅删除 `.spc` 文件**，不删除 `.html` 全文缓存文件
+- 要强制重新请求网页正文，只能等待 `limits.cache_duration` 过期（默认 3600s），或删除整个 `CACHE_PATH` 目录
 
 ### 场景 9：取消全文抓取配置后自动恢复
 - 用户删除 `pathEntries` 配置后，下次刷新触发恢复分支
@@ -1323,6 +1390,14 @@ feedController::actualizeFeeds()
 - 若 cURL 已用完 4 次 301/302 跳转，`$maxRedirs` 变为 0
 - 即使页面有 `<meta refresh>`，也会停止递归防止死循环
 - 总跳转次数 = HTTP 重定向次数 + HTML meta refresh 次数 ≤ 4
+
+### 场景 11：三种"重抓"机制的区别（易混淆）
+| 操作 | 作用范围 | 删除的缓存 | 不删除的缓存 |
+|------|----------|-----------|-------------|
+| `loadCompleteContent(true)` | 单篇文章 | 无（仅跳过 DB 查询） | `.html` / `.spc` / Retry-After |
+| `Feed::load(false, true)` | 整个 Feed | 无（仅跳过 hash 比较） | `.html` / `.spc` / Retry-After |
+| `$feed->clearCache()` | Feed 级 | `.spc` + favicon | `.html` 全文缓存 / Retry-After |
+| `cleanCache(720h)` | 全局所有缓存 | 所有过期文件 | 未过期文件 |
 
 ---
 
